@@ -1,0 +1,17 @@
+# 个人电子图书馆 — Python 依赖
+# simple_server.py 使用纯标准库，无需安装第三方包即可运行
+# 以下为可选工具脚本（scripts/ 目录下）所需的依赖
+# 安装命令: pip install -r requirements.txt
+
+# 文本提取（extract_text.py, extract_covers.py 等）
+PyMuPDF>=1.22.0
+
+# HTTP 请求（auto_summary.py, auto_classify.py 等调用 AI 接口）
+requests>=2.28.0
+
+# 电子书解析（batch_import.py 等，simple_server.py 内置了基本解析）
+EbookLib>=0.18.0
+mobi>=0.3.0
+
+# 图片处理（extract_covers.py）
+Pillow>=10.0.0

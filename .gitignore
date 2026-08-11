@@ -1,0 +1,40 @@
+# === 数据文件（体积过大，不纳入版本控制）===
+data/
+*.db
+*.db-*
+*.db.bak*
+*.db-wal
+*.db-shm
+
+# === 归档目录 ===
+_archive/
+
+# === Python 缓存 ===
+__pycache__/
+*.pyc
+*.pyo
+
+# === 日志 ===
+*.log
+
+# === 临时文件 ===
+*.tmp
+*.bak
+*.swp
+*~
+
+# === 系统文件 ===
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# === IDE ===
+.vscode/
+.idea/
+
+# === 二进制工具 ===
+SumatraPDF/
+tools/
+
+# === WorkBuddy 内部 ===
+.workbuddy/
