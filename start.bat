@@ -1,7 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 chcp 65001 >nul
-title 个人电子图书馆
+title Private Lib
 
 cd /d "%~dp0"
 set "LIB_DIR=%~dp0"
@@ -42,6 +42,6 @@ echo.
 echo   🌐 http://localhost:8000
 echo   按 Ctrl+C 停止
 echo.
-python simple_server.py
+python Private_Lib.py
 
 pause

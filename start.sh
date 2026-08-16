@@ -1,12 +1,12 @@
 #!/bin/bash
-# 个人电子图书馆 — 启动脚本 (Mac/Linux)
+# Private Lib — 启动脚本 (Mac/Linux)
 
 echo "========================================"
-echo "         📚 个人电子图书馆"
+echo "         📚 Private Lib"
 echo "========================================"
 echo ""
 
 cd "$(dirname "$0")"
 
-echo "启动服务..."
-python3 server.py
+echo "Starting server..."
+python3 Private_Lib.py

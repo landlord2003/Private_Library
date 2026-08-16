@@ -18,7 +18,7 @@ echo.
 xcopy "%~dp0data" "%BACKUP_DIR%\data\" /E /I /Y /Q
 
 :: 备份核心代码
-copy "%~dp0simple_server.py" "%BACKUP_DIR%\" /Y >nul
+copy "%~dp0Private_Lib.py" "%BACKUP_DIR%\" /Y >nul
 copy "%~dp0requirements.txt" "%BACKUP_DIR%\" /Y >nul
 copy "%~dp0start.bat" "%BACKUP_DIR%\" /Y >nul
 copy "%~dp0backup.bat" "%BACKUP_DIR%\" /Y >nul

@@ -1,5 +1,5 @@
 """My Library Server"""
-import http.server, json, sqlite3, os, urllib.parse, uuid, hashlib, shutil, threading, time, subprocess, tempfile, concurrent.futures
+import http.server, json, sqlite3, os, urllib.parse, urllib.request, urllib.error, uuid, hashlib, shutil, threading, time, subprocess, tempfile, concurrent.futures
 
 from pathlib import Path
 
@@ -8,6 +8,27 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "library.db")
 _task_status = {}
 _count_cache = {"time": 0}
+
+class OllamaError(Exception): pass
+
+def _ollama_generate(prompt, model="qwen2.5:7b", timeout=180, temperature=0.1, num_ctx=4096, num_predict=None):
+    """调用 Ollama API，使用 stdlib urllib 替代 requests，无需安装第三方库"""
+    payload = {"model": model, "prompt": prompt, "stream": False, "temperature": temperature, "options": {"num_ctx": num_ctx}}
+    if num_predict is not None:
+        payload["options"]["num_predict"] = num_predict
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(OLLAMA_URL + "/api/generate", data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8")).get("response", "").strip()
+    except urllib.error.HTTPError as e:
+        raise OllamaError(f"Ollama API 错误: {e.code}")
+    except TimeoutError:
+        raise OllamaError(f"Ollama 超时: 超过{timeout}秒")
+    except urllib.error.URLError as e:
+        if "timed out" in str(e).lower():
+            raise OllamaError(f"Ollama 超时: 超过{timeout}秒")
+        raise OllamaError("Ollama连接失败，请确认Ollama正在运行")
 
 def get_counts():
     """同步获取统计数据。缓存 300 秒，导入新书后缓存被置 0 触发立即刷新。"""
@@ -215,6 +236,24 @@ function editMediaTitle(mid,oldTitle){
 }
 function EDTM(mid){var t=prompt("新名称:");if(t&&t.trim()){var x=new XMLHttpRequest();x.open("POST","/api/media/"+mid+"/edit");x.setRequestHeader("Content-Type","application/json");x.onload=function(){location.reload()};x.send(JSON.stringify({title:t.trim()}));}}
 
+// 删除书籍/媒体 20260816
+function DELB(id,title){
+  if(!confirm("⚠️ 确定要删除这本书吗？\\n\\n《"+title+"》\\n\\n将删除：书籍记录、AI 摘要、分类/标签/作者关联、阅读笔记、封面。\\n注：网页上传的书会连源文件一起删除；磁盘扫描导入的原始文件会保留。\\n\\n此操作不可恢复！"))return;
+  if(!confirm("再次确认：真的要删除《"+title+"》吗？删除后无法找回！"))return;
+  var x=new XMLHttpRequest();x.open("POST","/api/books/"+id+"/delete");x.setRequestHeader("Content-Type","application/json");
+  x.onload=function(){try{var r=JSON.parse(x.responseText);if(r.ok){alert("已删除");location.href="/?p=books";}else alert("删除失败: "+(r.error||"未知错误"));}catch(e){alert("删除失败")}};
+  x.onerror=function(){alert("删除失败：网络错误")};
+  x.send("{}");
+}
+function DELM(id,title){
+  if(!confirm("⚠️ 确定要删除这个媒体文件吗？\\n\\n「"+title+"」\\n\\n将删除：媒体记录、转录文字、AI 摘要、标签/分类/笔记、上传的源文件。\\n\\n此操作不可恢复！"))return;
+  if(!confirm("再次确认：真的要删除「"+title+"」吗？删除后无法找回！"))return;
+  var x=new XMLHttpRequest();x.open("POST","/api/media/"+id+"/delete");x.setRequestHeader("Content-Type","application/json");
+  x.onload=function(){try{var r=JSON.parse(x.responseText);if(r.ok){alert("已删除");location.href="/?p=media";}else alert("删除失败: "+(r.error||"未知错误"));}catch(e){alert("删除失败")}};
+  x.onerror=function(){alert("删除失败：网络错误")};
+  x.send("{}");
+}
+
 </script>"""
 
 def parse_multipart(content_type, body):
@@ -238,22 +277,127 @@ def parse_multipart(content_type, body):
         if name: fields[name] = {'filename': filename, 'data': data}
     return fields
 
+from contextlib import contextmanager
+
+@contextmanager
+def _suppress_mupdf_stdout():
+    """抑制 MuPDF 及 SWIG 回调写到 stdout/stderr 的 CSS/字体错误信息"""
+    _fd1 = os.dup(1)
+    _fd2 = os.dup(2)
+    _devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(_devnull, 1)
+    os.dup2(_devnull, 2)
+    try:
+        yield
+    finally:
+        os.dup2(_fd1, 1)
+        os.dup2(_fd2, 2)
+        os.close(_devnull)
+        os.close(_fd1)
+        os.close(_fd2)
+
+def _extract_epub_cover_zip(file_path):
+    """从 EPUB ZIP 中直接提取封面图片（比 MuPDF 渲染快 10x+）"""
+    import zipfile, xml.etree.ElementTree as ET
+    OPF = '{http://www.idpf.org/2007/opf}'
+    CNT = '{urn:oasis:names:tc:opendocument:xmlns:container}'
+    try:
+        with zipfile.ZipFile(file_path, 'r') as zf:
+            # 1. container.xml → OPF 路径
+            croot = ET.fromstring(zf.read('META-INF/container.xml'))
+            opf_path = None
+            for rf in croot.iter(CNT + 'rootfile'):
+                if rf.get('media-type') == 'application/oebps-package+xml':
+                    opf_path = rf.get('full-path'); break
+            if not opf_path: return None
+            # 2. 解析 OPF，收集 manifest items
+            oroot = ET.fromstring(zf.read(opf_path))
+            opf_dir = opf_path.rsplit('/', 1)[0] + '/' if '/' in opf_path else ''
+            items = {}
+            for item in oroot.iter(OPF + 'item'):
+                iid = item.get('id'); items[iid] = {
+                    'href': item.get('href',''), 'mt': item.get('media-type',''),
+                    'props': item.get('properties','')
+                }
+            # 3. 找封面 ID（三种常见方式）
+            cover_id = None
+            for meta in oroot.iter(OPF + 'meta'):
+                if meta.get('name') == 'cover': cover_id = meta.get('content'); break
+            if not cover_id:
+                for iid, it in items.items():
+                    if 'cover-image' in it['props']: cover_id = iid; break
+            if not cover_id:
+                for iid, it in items.items():
+                    if 'cover' in iid.lower() and it['mt'].startswith('image/'): cover_id = iid; break
+            if not cover_id or cover_id not in items: return None
+            # 4. 提取图片
+            href = items[cover_id]['href']
+            for path in [opf_dir + href, href]:
+                try:
+                    data = zf.read(path)
+                    if len(data) > 500: return data
+                except KeyError: continue
+    except: pass
+    return None
+
 def extract_cover_for(book_id, file_path, fmt):
     try:
         file_path = _resolve_path(file_path)
         cover_data = None
-        if fmt == 'pdf':
-            import fitz; doc = fitz.open(file_path)
-            if doc.page_count > 0: pix = doc[0].get_pixmap(dpi=72); cover_data = pix.tobytes("jpg")
-            doc.close()
-        elif fmt == 'epub':
-            from ebooklib import epub; bk = epub.read_epub(file_path)
-            for item in bk.get_items():
-                if item.get_type() == 6 and ('cover' in str(item.get_name()).lower() or 'cover' in str(item.get_id()).lower()):
-                    cover_data = item.get_content(); break
+        if fmt == 'epub':
+            # 快速路径：直接从 ZIP 提取封面图片
+            cover_data = _extract_epub_cover_zip(file_path)
             if not cover_data:
-                for item in bk.get_items():
-                    if item.get_type() == 6: cover_data = item.get_content(); break
+                # 慢速路径：MuPDF 渲染第一页
+                import fitz
+                with _suppress_mupdf_stdout():
+                    doc = fitz.open(file_path)
+                    if doc.page_count > 0:
+                        pix = doc[0].get_pixmap(dpi=72); cover_data = pix.tobytes("jpg")
+                    doc.close()
+        elif fmt in ('pdf','mobi','azw3'):
+            import fitz
+            with _suppress_mupdf_stdout():
+                doc = fitz.open(file_path)
+                if doc.page_count > 0:
+                    pix = doc[0].get_pixmap(dpi=72); cover_data = pix.tobytes("jpg")
+                doc.close()
+        elif fmt in ('rar','zip'):
+            import tempfile,subprocess
+            r = subprocess.run([SEVEN_ZIP, 'l', '-slt', '-sccUTF-8', file_path], capture_output=True, text=True, timeout=30)
+            entries = []; cur = {}
+            for line in r.stdout.split('\n'):
+                if line.startswith('Path ='): cur['path'] = line[7:].strip()
+                elif line.startswith('Size ='): cur['size'] = int(line[7:].strip()) if line[7:].strip().isdigit() else 0
+                elif line == '' and 'path' in cur: entries.append(cur); cur = {}
+            if 'path' in cur: entries.append(cur)
+            # 优先找PDF
+            pdf_entry = next((e for e in entries if e['path'].lower().endswith('.pdf') and e.get('size',0) > 10000), None)
+            if pdf_entry:
+                tmpdir = tempfile.mkdtemp()
+                try:
+                    subprocess.run([SEVEN_ZIP, 'e', '-o'+tmpdir, '-sccUTF-8', '-y', file_path, pdf_entry['path']], capture_output=True, timeout=60)
+                    tmp_pdf = os.path.join(tmpdir, os.path.basename(pdf_entry['path']))
+                    if os.path.exists(tmp_pdf):
+                        import fitz
+                        with _suppress_mupdf_stdout():
+                            doc = fitz.open(tmp_pdf)
+                            if doc.page_count > 0: pix = doc[0].get_pixmap(dpi=72); cover_data = pix.tobytes("jpg")
+                            doc.close()
+                finally:
+                    import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
+            # 没有PDF就找图片
+            if not cover_data:
+                img_entry = next((e for e in entries if e['path'].lower().endswith(('.jpg','.jpeg','.png','.bmp')) and e.get('size',0) > 5000), None)
+                if img_entry:
+                    tmpdir = tempfile.mkdtemp()
+                    try:
+                        subprocess.run([SEVEN_ZIP, 'e', '-o'+tmpdir, '-sccUTF-8', '-y', file_path, img_entry['path']], capture_output=True, timeout=60)
+                        tmp_img = os.path.join(tmpdir, os.path.basename(img_entry['path']))
+                        if os.path.exists(tmp_img):
+                            with open(tmp_img, 'rb') as f: cover_data = f.read()
+                    finally:
+                        import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
         if cover_data and len(cover_data) > 500:
             cvp = os.path.join("data","covers",book_id+".jpg"); os.makedirs(os.path.dirname(cvp),exist_ok=True)
             with open(cvp,'wb') as f: f.write(cover_data)
@@ -471,7 +615,6 @@ def run_extract_async(count=10):
 
 def run_classify_async(count=10):
     if _task_status.get('cr'): return {"status":"running"}
-    import requests
     _task_status['cr'] = True
     _task_status['cr_r'] = {"done":0,"total":0}
     def w():
@@ -483,8 +626,7 @@ def run_classify_async(count=10):
                 try:
                     clist="\n".join("- "+c for c in cats)
                     prompt=f"判断以下书籍类别。可选类别：\n{clist}\n\n书名：{b['title']}\n内容：{(b['text_content'] or '')[:1500]}\n只返回JSON：{{\"category\":\"类别名\",\"tags\":[\"标签1\",\"标签2\"],\"difficulty\":\"入门/中级/高级\"}}"
-                    r=requests.post("http://127.0.0.1:11434/api/generate",json={"model":"qwen2.5:7b","prompt":prompt,"stream":False,"temperature":0.1,"options":{"num_ctx":4096}},timeout=180)
-                    resp=r.json()["response"].strip()
+                    resp=_ollama_generate(prompt, model="qwen2.5:7b", timeout=180, temperature=0.1, num_ctx=4096)
                     if resp.startswith("```"): resp=resp.split("\n",1)[1].rsplit("\n",1)[0]
                     result=json.loads(resp)
                     cn=result.get("category","其他")
@@ -507,7 +649,6 @@ def run_classify_async(count=10):
 
 def run_summarize_async(count=3):
     if _task_status.get('sr'): return {"status":"running"}
-    import requests
     _task_status['sr'] = True
     _task_status['sr_r'] = {"done":0,"total":0}
     def w():
@@ -517,8 +658,7 @@ def run_summarize_async(count=3):
             for b in books:
                 try:
                     prompt=f"你是专业图书摘要助手。书名：{b['title']}\n内容：{(b['text_content'] or '')[:2000]}\n按以下结构输出（中文）：\n1. 一句话总结\n2. 核心观点（3-5条）\n3. 关键概念\n4. 适合读者\n5. 难度评级：入门/中级/高级"
-                    r=requests.post("http://127.0.0.1:11434/api/generate",json={"model":"qwen2.5:7b","prompt":prompt,"stream":False,"temperature":0.3,"options":{"num_ctx":4096}},timeout=300)
-                    summary=r.json()["response"].strip()
+                    summary=_ollama_generate(prompt, model="qwen2.5:7b", timeout=300, temperature=0.3, num_ctx=4096)
                     if len(summary)>20:
                         dbe("UPDATE books SET summary=?,summary_model=?,summary_updated=datetime('now') WHERE id=?",(summary,"qwen2.5:7b",b['id']))
                         if "高级" in summary: dbe("UPDATE books SET difficulty='高级' WHERE id=? AND difficulty IS NULL",(b['id'],))
@@ -589,7 +729,6 @@ def transcribe_file(file_path, media_type="audio"):
             except: pass
 
 def summarize_text(text, model_name="qwen2.5:7b", timeout_sec=180):
-    import requests
     if len(text) > 8000:
         text = text[:8000] + "\n... (文本过长已截断)"
     prompt = f"""请为以下音频/视频的转录文字写一个简洁的摘要（300字以内），包括：
@@ -602,15 +741,10 @@ def summarize_text(text, model_name="qwen2.5:7b", timeout_sec=180):
 
 摘要："""
     try:
-        resp = requests.post(f"{OLLAMA_URL}/api/generate", json={"model": model_name, "prompt": prompt, "stream": False, "options": {"num_predict": 600}}, timeout=timeout_sec)
-        if resp.status_code == 200:
-            result = resp.json().get("response", "").strip()
-            return result if result else "[摘要为空]"
-        return f"[摘要API错误: {resp.status_code}]"
-    except requests.exceptions.Timeout:
-        return f"[摘要超时: 超过{timeout_sec}秒]"
-    except requests.exceptions.ConnectionError:
-        return "[摘要失败: Ollama连接失败，请确认Ollama正在运行]"
+        result = _ollama_generate(prompt, model=model_name, timeout=timeout_sec, temperature=0.3, num_predict=600)
+        return result if result else "[摘要为空]"
+    except OllamaError as e:
+        return f"[摘要失败: {str(e)[:100]}]"
     except Exception as e:
         return f"[摘要请求失败: {str(e)[:100]}]"
 
@@ -811,11 +945,20 @@ def run_scan_import_async(directory, itype='all'):
     return {"status":"started"}
 
 class H(http.server.SimpleHTTPRequestHandler):
+    timeout = 600  # 防止请求体读取永久挂起
+    def _rlog(self, msg):
+        try:
+            import datetime as _dtmod
+            with open("_req_log.txt","a",encoding="utf-8") as _lf:
+                _lf.write(f"[{_dtmod.datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+        except Exception: pass
     def do_POST(self):
         p = urllib.parse.urlparse(self.path); path = p.path
         ctype = self.headers.get('Content-Type','')
         length = int(self.headers.get('Content-Length',0))
+        self._rlog(f"POST {path} clen={length}")
         body = self.rfile.read(length) if length > 0 else b''
+        if length > 0: self._rlog(f"POST {path} body read: {len(body)}/{length} bytes")
         try:
             if 'multipart/form-data' in ctype: self._handle_upload(ctype,body); return
             data = json.loads(body) if body else {}
@@ -835,6 +978,31 @@ class H(http.server.SimpleHTTPRequestHandler):
                 mid=path.split("/")[3]; title=data.get('title','').strip()
                 if title: dbe("UPDATE media SET title=?, updated_at=datetime('now') WHERE id=?",(title,mid)); self.json({"ok":True,"title":title})
                 else: self.json({"error":"title empty"}); return
+            # 删除书籍 20260816：DB记录+关联+封面；上传的书删源文件目录，扫描导入的原始文件保留
+            if path.startswith("/api/books/") and path.endswith("/delete"):
+                bid=path.split("/")[3]
+                if not dbq("SELECT id FROM books WHERE id=?",(bid,)): self.json({"error":"book not found"}); return
+                dbe("DELETE FROM book_authors WHERE book_id=?",(bid,))
+                dbe("DELETE FROM book_tags WHERE book_id=?",(bid,))
+                dbe("DELETE FROM book_categories WHERE book_id=?",(bid,))
+                dbe("DELETE FROM reading_notes WHERE book_id=?",(bid,))
+                dbe("DELETE FROM books WHERE id=?",(bid,))
+                try: os.remove(os.path.join("data","covers",bid+".jpg"))
+                except: pass
+                shutil.rmtree(os.path.join("data","books",bid), ignore_errors=True)
+                _count_cache["time"]=0
+                self.json({"ok":True}); return
+            # 删除媒体 20260816
+            if path.startswith("/api/media/") and path.endswith("/delete"):
+                mid=path.split("/")[3]
+                if not dbq("SELECT id FROM media WHERE id=?",(mid,)): self.json({"error":"media not found"}); return
+                dbe("DELETE FROM media_tags WHERE media_id=?",(mid,))
+                dbe("DELETE FROM media_categories WHERE media_id=?",(mid,))
+                dbe("DELETE FROM media_notes WHERE media_id=?",(mid,))
+                dbe("DELETE FROM media WHERE id=?",(mid,))
+                shutil.rmtree(os.path.join("data","media",mid), ignore_errors=True)
+                _count_cache["time"]=0
+                self.json({"ok":True}); return
 
             self.send_error(404)
         except Exception as e: self.send_error(500, str(e))
@@ -866,7 +1034,15 @@ class H(http.server.SimpleHTTPRequestHandler):
         h = hashlib.sha256(); h.update(data); fh = h.hexdigest()
         
         if is_book:
-            if dbq("SELECT id FROM books WHERE file_hash=?",(fh,)): self.json({"duplicate":True}); return
+            _rows = dbq("SELECT id,title,file_path FROM books WHERE file_hash=?",(fh,))
+            if _rows:
+                _row = _rows[0]
+                try:
+                    import datetime as _dt
+                    with open("_dup_log.txt","a",encoding="utf-8") as _lf:
+                        _lf.write(f"[{_dt.datetime.now()}] books hash={fh} -> id={_row['id']} title={_row['title']} path={_row['file_path']}\n")
+                except Exception: pass
+                self.json({"duplicate":True,"existing_id":_row['id'],"existing_title":_row['title']}); return
             bid=str(uuid.uuid4()); dd=os.path.join("data","books",bid); os.makedirs(dd,exist_ok=True)
             dest=os.path.join(dd,"original"+ext); fmt=ext.lstrip('.')
             with open(dest,'wb') as f: f.write(data)
@@ -877,7 +1053,8 @@ class H(http.server.SimpleHTTPRequestHandler):
             _count_cache["time"] = 0
             self.json({"success":True,"id":bid,"title":fn,"type":"book"})
         else:
-            if dbq("SELECT id FROM media WHERE file_hash=?",(fh,)): self.json({"duplicate":True}); return
+            _mrows = dbq("SELECT id,title FROM media WHERE file_hash=?",(fh,))
+            if _mrows: self.json({"duplicate":True,"existing_id":_mrows[0]['id'],"existing_title":_mrows[0]['title']}); return
             mid=str(uuid.uuid4()); dd=os.path.join("data","media",mid); os.makedirs(dd,exist_ok=True)
             dest=os.path.join(dd,"original"+ext); fmt=ext.lstrip('.')
             media_type = 'audio' if ext in {'.mp3','.wav','.flac','.aac','.ogg','.wma','.m4a'} else 'video'
@@ -1002,7 +1179,72 @@ class H(http.server.SimpleHTTPRequestHandler):
                     cached = extracted
                 if os.path.exists(cached):
                     ext = os.path.splitext(inner_fn)[1].lower()
+                    raw_mode = qs.get('raw', [''])[0] == '1'
                     ctypes = {'.pdf':'application/pdf','.epub':'application/epub+zip','.txt':'text/plain','.jpg':'image/jpeg','.jpeg':'image/jpeg','.png':'image/png','.gif':'image/gif','.webp':'image/webp'}
+                    # PDF 用 PDF.js 渲染，绕过浏览器内置 PDF 阅读器的暗色反色
+                    if ext == '.pdf' and not raw_mode:
+                        raw_url = path + ('&raw=1' if p.query else '?raw=1')
+                        viewer = '''<!DOCTYPE html><html><head><meta charset=utf-8>
+<meta name="color-scheme" content="light only">
+<title>''' + he(inner_fn) + '''</title>
+<style>
+:root{color-scheme:light only}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:#f0f0f0;overflow:hidden;font-family:sans-serif}
+#toolbar{position:fixed;top:0;left:0;right:0;height:44px;background:#3b3b3b;display:flex;align-items:center;padding:0 12px;z-index:100;gap:8px}
+#toolbar button{background:#555;color:#fff;border:none;border-radius:4px;padding:5px 12px;cursor:pointer;font-size:13px}
+#toolbar button:hover{background:#777}
+#toolbar span{color:#ccc;font-size:13px}
+#pageNum{width:50px;text-align:center;background:#555;color:#fff;border:1px solid #777;border-radius:3px;padding:3px 6px;font-size:13px}
+#canvasWrap{margin-top:44px;height:calc(100% - 44px);overflow:auto;display:flex;justify-content:center}
+#pdfCanvas{background:#fff;box-shadow:0 2px 8px rgba(0,0,0,0.3)}
+</style></head><body>
+<div id="toolbar">
+<button onclick="prevPage()">◀ 上一页</button>
+<span>第 <input id="pageNum" value="1" onchange="goPage()"> / <span id="pageCount">-</span> 页</span>
+<button onclick="nextPage()">下一页 ▶</button>
+<span style="flex:1"></span>
+<button onclick="zoomOut()">−</button>
+<span id="zoomLabel">120%</span>
+<button onclick="zoomIn()">+</button>
+</div>
+<div id="canvasWrap"><canvas id="pdfCanvas"></canvas></div>
+<script src="/pdfjs/pdf.min.js"></script>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc='/pdfjs/pdf.worker.min.js';
+var pdfDoc=null,pageNum=1,pageRendering=false,pendingPage=null,scale=1.2;
+function renderPage(n){
+  if(pageRendering){pendingPage=n;return;}
+  pageRendering=true;
+  pdfDoc.getPage(n).then(function(page){
+    var viewport=page.getViewport({scale:scale});
+    var canvas=document.getElementById('pdfCanvas');
+    canvas.height=viewport.height;canvas.width=viewport.width;
+    var ctx=canvas.getContext('2d');
+    page.render({canvasContext:ctx,viewport:viewport}).promise.then(function(){
+      pageRendering=false;
+      if(pendingPage!==null){renderPage(pendingPage);pendingPage=null;}
+    });
+  });
+  document.getElementById('pageNum').value=n;
+}
+function prevPage(){if(pageNum<=1)return;pageNum--;renderPage(pageNum);}
+function nextPage(){if(pageNum>=pdfDoc.numPages)return;pageNum++;renderPage(pageNum);}
+function goPage(){var n=parseInt(document.getElementById('pageNum').value);if(n>=1&&n<=pdfDoc.numPages){pageNum=n;renderPage(pageNum);}}
+function zoomIn(){scale*=1.2;document.getElementById('zoomLabel').textContent=Math.round(scale*100)+'%';renderPage(pageNum);}
+function zoomOut(){scale/=1.2;document.getElementById('zoomLabel').textContent=Math.round(scale*100)+'%';renderPage(pageNum);}
+pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
+  pdfDoc=pdf;
+  document.getElementById('pageCount').textContent=pdf.numPages;
+  renderPage(1);
+});
+</script>
+</body></html>'''
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.end_headers()
+                        self.wfile.write(viewer.encode('utf-8'))
+                        return
                     self.send_response(200)
                     self.send_header("Content-Type", ctypes.get(ext, "application/octet-stream"))
                     self.send_header("Content-Disposition", "inline")
@@ -1020,6 +1262,20 @@ class H(http.server.SimpleHTTPRequestHandler):
                     self.end_headers()
                     with open(fp,'rb')as f: self.wfile.write(f.read())
                 else: self.send_error(404)
+            elif path.startswith("/pdfjs/"):
+                # Serve PDF.js static files
+                rel = path[7:]  # strip "/pdfjs/" (7 chars)
+                base = os.path.dirname(os.path.abspath(__file__))
+                fp = os.path.join(base, "pdfjs", rel)
+                if os.path.exists(fp) and os.path.isfile(fp):
+                    ext = os.path.splitext(fp)[1].lower()
+                    ct = {'.js':'application/javascript','.css':'text/css','.html':'text/html','.json':'application/json'}.get(ext, 'application/octet-stream')
+                    self.send_response(200)
+                    self.send_header("Content-Type", ct)
+                    self.end_headers()
+                    with open(fp, 'rb') as f: self.wfile.write(f.read())
+                else:
+                    self.send_error(404)
             elif path.startswith("/api/covers/"):
                 cv = Path("data/covers")/path.split("/")[-1]
                 if cv.exists():
@@ -1058,7 +1314,7 @@ class H(http.server.SimpleHTTPRequestHandler):
             if cat:s+=" AND id IN (SELECT book_id FROM book_categories WHERE category_id=?)";pa.append(cat)
             if fmt:s+=" AND file_format=?";pa.append(fmt)
             total=dbq("SELECT count(*)as c FROM books WHERE "+s.split("WHERE",1)[1],tuple(pa))[0]['c']
-            s+=" ORDER BY created_at DESC LIMIT 20 OFFSET "+str((bp-1)*20)
+            s+=" ORDER BY created_at DESC, title ASC LIMIT 20 OFFSET "+str((bp-1)*20)
             rows=dbq(s,tuple(pa))
             h+='<h2>📖 书库'+(' - '+fmt.upper() if fmt else '')+' ('+str(len(rows))+'/'+str(total)+')</h2>'
             h+='<form class=sch method=get><input type=hidden name=p value=books><input type=hidden name=fmt value="'+he(fmt)+'"><input name=q placeholder=搜索书名 value="'+he(q)+'"><select name=cat><option value="">全部分类</option>'
@@ -1104,7 +1360,9 @@ class H(http.server.SimpleHTTPRequestHandler):
                     read_url='/api/books/'+bid+'/'+('file'if b['file_format']=='pdf'else'read')
                     h+='<div class=sec><a href="'+read_url+'" class=btn target=_blank>📖 阅读</a>'                                                                       #260727 修改 调用SumatraPDF
                     h+=' <a href="#" class=btn onclick="event.preventDefault();fetch(\'/api/books/'+bid+'/open\')">📖 外部阅读</a>'
-                    h+=' <a href="/?p=books" class="btn bb2">返回</a></div></div>'                                                                                                #260727 修改 调用SumatraPDF
+                    _jt=str(b['title']).replace('\\','\\\\').replace("'","\\'").replace('\n',' ')   #260816 删除按钮（标题做JS转义）
+                    h+=' <a href="#" class=btn style="background:#ff4d4f;color:#fff" onclick="event.preventDefault();DELB(\''+bid+'\',\''+_jt+'\')">🗑️ 删除</a>'
+                    h+=' <a href="javascript:history.back()" class="btn bb2">返回</a></div></div>'
         elif pn=='media_detail':
             mid=qs.get('id',[''])[0]
             m=dbq("SELECT * FROM media WHERE id=?",(mid,))
@@ -1114,12 +1372,14 @@ class H(http.server.SimpleHTTPRequestHandler):
                 
                 h+='<h2>'+ic+' '+he(str(m['title']))[:60]+' <button class="btn btn-sm" onclick="event.stopPropagation();EDTM(\''+mid+'\')" style=margin-left:8px>✏️ 编辑</button></h2>'
 
-                h+='<p class=co><a href="/?p=media">← 返回</a></p>'
+                h+='<p class=co><a href="javascript:history.back()">← 返回</a></p>'
                 h+='<div class=panel><h3>📋 基本信息</h3>'
                 h+='<p><b>格式:</b> '+m['file_format'].upper()+' | <b>时长:</b> '+dur+' | <b>大小:</b> '+str(round(m['file_size']/1024/1024,1))+'MB</p>'
                 if m['artist']:h+='<p><b>艺术家:</b> '+he(str(m['artist']))+'</p>'
                 if m['album']:h+='<p><b>专辑:</b> '+he(str(m['album']))+'</p>'
-                h+='<p><a href="/api/media/'+mid+'/file" class=btn target=_blank>▶️ 播放</a></p></div>'
+                h+='<p><a href="/api/media/'+mid+'/file" class=btn target=_blank>▶️ 播放</a>'
+                _mt=str(m['title']).replace('\\','\\\\').replace("'","\\'").replace('\n',' ')   #260816 删除按钮
+                h+=' <a href="#" class=btn style="background:#ff4d4f;color:#fff" onclick="event.preventDefault();DELM(\''+mid+'\',\''+_mt+'\')">🗑️ 删除</a></p></div>'
                 h+='<div class=panel><h3>🎙️ 转录文字</h3>'
                 if m['transcript']:
                     full_len=len(m['transcript'])
@@ -1143,7 +1403,7 @@ class H(http.server.SimpleHTTPRequestHandler):
             rows=dbq("SELECT id,title,media_type,file_format,duration,file_size,transcript,summary FROM media WHERE status='active' AND transcript IS NOT NULL AND transcript NOT LIKE '[转录失败%' AND transcript NOT LIKE '[转录超时%' AND transcript!='[文件不存在]' ORDER BY updated_at DESC LIMIT 30 OFFSET ?",((mp-1)*30,))
             total=dbq("SELECT count(*)as c FROM media WHERE status='active' AND transcript IS NOT NULL AND transcript NOT LIKE '[转录失败%' AND transcript NOT LIKE '[转录超时%' AND transcript!='[文件不存在]'")[0]['c']
             h+='<h2>🎙️ 已转录媒体 ('+str(len(rows))+'/'+str(total)+')</h2>'
-            h+='<p class=co><a href="/?p=media">← 返回媒体库</a></p>'
+            h+='<p class=co><a href="javascript:history.back()">← 返回媒体库</a></p>'
             for r in rows:
                 ic='🎵'if r['media_type']=='audio'else'🎬';d=r['duration']or 0;dur=str(int(d//60))+':'+str(int(d%60)).zfill(2)
                 badges=''
@@ -1163,7 +1423,7 @@ class H(http.server.SimpleHTTPRequestHandler):
             rows=dbq("SELECT id,title,media_type,file_format,duration,file_size,transcript,summary FROM media WHERE status='active' AND summary IS NOT NULL AND summary NOT LIKE '[摘要%' AND summary NOT LIKE '[无可转录%' AND summary!='[摘要结果为空]' ORDER BY summary_updated DESC LIMIT 30 OFFSET ?",((mp-1)*30,))
             total=dbq("SELECT count(*)as c FROM media WHERE status='active' AND summary IS NOT NULL AND summary NOT LIKE '[摘要%' AND summary NOT LIKE '[无可转录%' AND summary!='[摘要结果为空]'")[0]['c']
             h+='<h2>📝 已摘要媒体 ('+str(len(rows))+'/'+str(total)+')</h2>'
-            h+='<p class=co><a href="/?p=media">← 返回媒体库</a></p>'
+            h+='<p class=co><a href="javascript:history.back()">← 返回媒体库</a></p>'
             for r in rows:
                 ic='🎵'if r['media_type']=='audio'else'🎬';d=r['duration']or 0;dur=str(int(d//60))+':'+str(int(d%60)).zfill(2)
                 h+='<div class=bk><div style="width:60px;height:60px;border-radius:8px;background:linear-gradient(135deg,#667eea,#764ba2);display:flex;align-items:center;justify-content:center;font-size:28px;color:#fff;flex-shrink:0">'+ic+'</div><div class=info><div class=t><a href="/?p=media_detail&id='+r['id']+'">'+he(r['title'])[:60]+'</a></div><div class=m>'+r['file_format'].upper()+' · '+dur+' · '+str(round(r['file_size']/1024/1024,1))+'MB <span class="badge badge-ok">已摘要</span> '
@@ -1252,7 +1512,7 @@ class H(http.server.SimpleHTTPRequestHandler):
         h+=COMMON_JS
       
         if pn=='import':
-            h+='<script>var _f=[],_i=0,_ok=0,_d=0,_e=0;function UF(fs){_f=Array.from(fs);_i=0;_ok=0;_d=0;_e=0;NX()}function NX(){if(_i>=_f.length){document.getElementById("up").innerHTML="完成! 新增 "+_ok+" 个, 重复 "+_d+" 个"+(_e>0?", 失败 "+_e+" 个":"")+" <a href=/ onclick=location.reload()>刷新</a>";return}var fd=new FormData();fd.append("file",_f[_i]);fd.append("import_type",document.getElementById("importType").value);_i++;var x=new XMLHttpRequest();x.open("POST","/api/import-upload");x.onload=function(){try{var r=JSON.parse(x.responseText);if(r.success)_ok++;else if(r.duplicate)_d++;else _e++;if(r.error)alert("错误: "+r.error)}catch(e){_e++}document.getElementById("up").innerHTML="上传中... "+_i+"/"+_f.length;NX()};x.onerror=function(){_e++;NX()};x.send(fd)};function SCAN(){var d=document.getElementById("scanDir").value;if(!d){alert("请输入目录路径");return}var t=document.getElementById("importType").value;document.getElementById("scanRes").innerHTML="正在启动扫描...";fetch("/api/import-scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({dir:d,import_type:t})}).then(r=>r.json()).then(r=>{if(r.status==="running"){alert("已有扫描任务在运行");SCNP()}else if(r.status==="started"){SCNP()}}).catch(e=>{document.getElementById("scanRes").innerHTML="启动失败: "+e})}function SCNP(){var x=new XMLHttpRequest();x.open("GET","/api/task-status");x.onload=function(){try{var r=JSON.parse(x.responseText);var s=r.scan_import||{};if(s.total>0){var pct=Math.round(s.done/s.total*100);document.getElementById("scanRes").innerHTML="导入中... "+s.done+"/"+s.total+" ("+pct+"%)"+(s.current?"<br>当前: "+s.current:"")+(s.duplicates?" 重复:"+s.duplicates:"")+(s.errors?" 失败:"+s.errors:"");if(s.done<s.total){setTimeout(SCNP,2000)}else{document.getElementById("scanRes").innerHTML+="<br><b>"+(s.message||"完成")+"</b> <a href=/ onclick=location.reload()>刷新</a>"}}else if(s.message){document.getElementById("scanRes").innerHTML=s.message;if(s.done<s.total||s.total===0){setTimeout(SCNP,2000)}}}catch(e){}};x.send()}</script>'
+            h+='<script>var _f=[],_i=0,_ok=0,_d=0,_e=0;function UF(fs){_f=Array.from(fs);_i=0;_ok=0;_d=0;_e=0;_dt=[];NX()}function NX(){if(_i>=_f.length){document.getElementById("up").innerHTML="完成! 新增 "+_ok+" 个, 重复 "+_d+" 个"+(_e>0?", 失败 "+_e+" 个":"")+( (_dt&&_dt.length)?"<br>重复文件对应: "+_dt.map(function(t){return "《"+t+"》"}).join("、") :"")+" <a href=/ onclick=location.reload()>刷新</a>";return}var fd=new FormData();fd.append("file",_f[_i]);fd.append("import_type",document.getElementById("importType").value);_i++;var x=new XMLHttpRequest();x.open("POST","/api/import-upload");x.onload=function(){try{var r=JSON.parse(x.responseText);if(r.success)_ok++;else if(r.duplicate){_d++;_dt=(_dt||[]);_dt.push(r.existing_title||"未知")}else _e++;if(r.error)alert("错误: "+r.error)}catch(e){_e++}document.getElementById("up").innerHTML="上传中... "+_i+"/"+_f.length;NX()};x.onerror=function(){_e++;NX()};x.send(fd)};function SCAN(){var d=document.getElementById("scanDir").value;if(!d){alert("请输入目录路径");return}var t=document.getElementById("importType").value;document.getElementById("scanRes").innerHTML="正在启动扫描...";fetch("/api/import-scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({dir:d,import_type:t})}).then(r=>r.json()).then(r=>{if(r.status==="running"){alert("已有扫描任务在运行");SCNP()}else if(r.status==="started"){SCNP()}}).catch(e=>{document.getElementById("scanRes").innerHTML="启动失败: "+e})}function SCNP(){var x=new XMLHttpRequest();x.open("GET","/api/task-status");x.onload=function(){try{var r=JSON.parse(x.responseText);var s=r.scan_import||{};if(s.total>0){var pct=Math.round(s.done/s.total*100);document.getElementById("scanRes").innerHTML="导入中... "+s.done+"/"+s.total+" ("+pct+"%)"+(s.current?"<br>当前: "+s.current:"")+(s.duplicates?" 重复:"+s.duplicates:"")+(s.errors?" 失败:"+s.errors:"");if(s.done<s.total){setTimeout(SCNP,2000)}else{document.getElementById("scanRes").innerHTML+="<br><b>"+(s.message||"完成")+"</b> <a href=/ onclick=location.reload()>刷新</a>"}}else if(s.message){document.getElementById("scanRes").innerHTML=s.message;if(s.done<s.total||s.total===0){setTimeout(SCNP,2000)}}}catch(e){}};x.send()}</script>'
         h+='</main></body></html>'
         self._html(h)
 
@@ -1295,6 +1555,10 @@ def fix_drive_paths():
 
 if __name__ == "__main__":
     fix_drive_paths()
-    print("🚀 http://localhost:8000")
-    print("📚 我的图书馆服务已启动")
-    http.server.ThreadingHTTPServer(("0.0.0.0",8000), H).serve_forever()
+    HOST = os.environ.get("LIB_HOST", "127.0.0.1")
+    PORT = int(os.environ.get("LIB_PORT", "8000"))
+    print(f"🚀 http://localhost:{PORT}")
+    print(f"📚 Private Lib | listening on {HOST}:{PORT}")
+    if HOST == "0.0.0.0":
+        print("⚠️  监听所有网卡（局域网可访问）。仅限 127.0.0.1 请设 LIB_HOST=127.0.0.1")
+    http.server.ThreadingHTTPServer((HOST, PORT), H).serve_forever()

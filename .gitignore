@@ -16,12 +16,20 @@ __pycache__/
 
 # === 日志 ===
 *.log
+_dup_log.txt
+_req_log.txt
 
 # === 临时文件 ===
 *.tmp
 *.bak
 *.swp
 *~
+_*.html
+
+# === 修复脚本（一次性本地工具）===
+fix_permissions.bat
+fix_*.bat
+fix_*.ps1
 
 # === 系统文件 ===
 Thumbs.db
@@ -35,6 +43,7 @@ desktop.ini
 # === 二进制工具 ===
 SumatraPDF/
 tools/
+pdfjs/
 
 # === WorkBuddy 内部 ===
 .workbuddy/
