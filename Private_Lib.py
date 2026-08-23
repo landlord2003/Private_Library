@@ -1,5 +1,5 @@
 """My Library Server"""
-import http.server, json, sqlite3, os, urllib.parse, urllib.request, urllib.error, uuid, hashlib, shutil, threading, time, subprocess, tempfile, concurrent.futures
+import http.server, json, sqlite3, os, sys, io, urllib.parse, urllib.request, urllib.error, uuid, hashlib, shutil, threading, time, subprocess, tempfile, concurrent.futures
 
 from pathlib import Path
 
@@ -281,20 +281,16 @@ from contextlib import contextmanager
 
 @contextmanager
 def _suppress_mupdf_stdout():
-    """抑制 MuPDF 及 SWIG 回调写到 stdout/stderr 的 CSS/字体错误信息"""
-    _fd1 = os.dup(1)
-    _fd2 = os.dup(2)
-    _devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(_devnull, 1)
-    os.dup2(_devnull, 2)
+    """线程安全地抑制 MuPDF 的 stdout/stderr 警告（不用 os.dup2，避免多线程干扰）"""
+    _old_out = sys.stdout
+    _old_err = sys.stderr
+    sys.stdout = io.StringIO()
+    sys.stderr = io.StringIO()
     try:
         yield
     finally:
-        os.dup2(_fd1, 1)
-        os.dup2(_fd2, 2)
-        os.close(_devnull)
-        os.close(_fd1)
-        os.close(_fd2)
+        sys.stdout = _old_out
+        sys.stderr = _old_err
 
 def _extract_epub_cover_zip(file_path):
     """从 EPUB ZIP 中直接提取封面图片（比 MuPDF 渲染快 10x+）"""
@@ -337,7 +333,8 @@ def _extract_epub_cover_zip(file_path):
                     data = zf.read(path)
                     if len(data) > 500: return data
                 except KeyError: continue
-    except: pass
+    except Exception as _e:
+        print(f"[cover ERR] EPUB cover extract failed: {file_path} -> {_e}")
     return None
 
 def extract_cover_for(book_id, file_path, fmt):
@@ -402,7 +399,8 @@ def extract_cover_for(book_id, file_path, fmt):
             cvp = os.path.join("data","covers",book_id+".jpg"); os.makedirs(os.path.dirname(cvp),exist_ok=True)
             with open(cvp,'wb') as f: f.write(cover_data)
             dbe("UPDATE books SET cover_path=? WHERE id=?",(cvp,book_id))
-    except: pass
+    except Exception as e:
+        print(f"[cover_error] book_id={book_id} fmt={fmt}: {e}", flush=True)
 
 def _resolve_path(file_path):
        """相对→绝对 + 盘符自动适配"""
