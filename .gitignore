@@ -47,3 +47,4 @@ pdfjs/
 
 # === WorkBuddy 内部 ===
 .workbuddy/
+server_log.txt

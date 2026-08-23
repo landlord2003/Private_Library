@@ -450,6 +450,12 @@ def extract_archive_file(archive_path, file_name, dest_dir):
     import subprocess
     try:
         os.makedirs(dest_dir, exist_ok=True)
+    except (PermissionError, OSError) as e:
+        # 缓存目录 ACL 损坏（移动硬盘常见），回退到系统临时目录
+        print(f"[archive cache] dest_dir inaccessible, falling back to system temp: {e}", flush=True)
+        dest_dir = os.path.join(tempfile.gettempdir(), "private_lib_archives", os.path.basename(dest_dir))
+        os.makedirs(dest_dir, exist_ok=True)
+    try:
         subprocess.run([SEVEN_ZIP, 'e', archive_path, file_name, f'-o{dest_dir}', '-y'],
                        capture_output=True, timeout=120)
         extracted = os.path.join(dest_dir, os.path.basename(file_name))
@@ -1168,8 +1174,8 @@ class H(http.server.SimpleHTTPRequestHandler):
                 if not r: self.send_error(404); return
                 fp = _resolve_path(r[0]['file_path'])
                 if not os.path.exists(fp): self.send_error(404); return
-                # 提取到缓存目录
-                cache_dir = os.path.join("data", "temp", "archives", bid)
+                # 提取到缓存目录（用系统临时目录，避免移动硬盘 ACL 损坏）
+                cache_dir = os.path.join(tempfile.gettempdir(), "private_lib_archives", bid)
                 cached = os.path.join(cache_dir, os.path.basename(inner_fn))
                 if not os.path.exists(cached):
                     extracted = extract_archive_file(fp, inner_fn, cache_dir)
