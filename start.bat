@@ -6,6 +6,8 @@ title Private Lib
 cd /d "%~dp0"
 set "LIB_DIR=%~dp0"
 set "LIB_DRIVE=%~d0"
+:: 监听所有网卡，允许手机/局域网访问。仅本机访问请改回 127.0.0.1
+set "LIB_HOST=0.0.0.0"
 
 echo ╔══════════════════════════════════╗
 echo ║      📚 个人电子图书馆             ║
