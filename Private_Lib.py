@@ -85,7 +85,58 @@ def cc(c): return {'计算机与编程':'#1677ff','历史与人文':'#fa8c16','�
 
 CSS = """* { margin:0; padding:0; box-sizing:border-box; } body { font-family: "Microsoft YaHei", Arial, sans-serif; background: #f5f5f5; display: flex; min-height: 100vh; } nav { width: 200px; background: #fff; padding: 20px 0; box-shadow: 2px 0 8px rgba(0,0,0,0.05); } nav h2 { padding: 0 20px 20px; color: #1677ff; font-size: 18px; border-bottom: 1px solid #f0f0f0; margin-bottom: 10px; } nav a { display: block; padding: 12px 20px; color: #333; text-decoration: none; font-size: 15px; } nav a:hover { background: #e6f4ff; color: #1677ff; } main { flex: 1; padding: 24px; overflow-y: auto; } .sb { background: #fff; padding: 20px; border-radius: 8px; text-align: center; min-width: 140px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); text-decoration: none; color: inherit; } .sb .n { font-size: 28px; font-weight: bold; } .sb .l { font-size: 13px; color: #999; margin-top: 4px; } .row { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; } .tag { display: inline-block; padding: 3px 10px; border-radius: 4px; font-size: 12px; margin: 3px; color: #fff; } .panel { background: #fff; padding: 16px; border-radius: 8px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); } .panel h3 { margin-bottom: 12px; font-size: 16px; } .sch { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; } .sch input, .sch select { padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; } .sch input { flex: 1; min-width: 180px; } .sch button { padding: 8px 20px; background: #1677ff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; } .bk { background: #fff; border-radius: 8px; padding: 14px; margin-bottom: 8px; display: flex; gap: 12px; align-items: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05); cursor: pointer; } .bk:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.1); } .bk img { width: 50px; height: 70px; object-fit: cover; border-radius: 4px; flex-shrink: 0; } .bk .cv { width: 50px; height: 70px; border-radius: 4px; flex-shrink: 0; background: linear-gradient(135deg, #667eea, #764ba2); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 22px; } .bk .info { flex: 1; min-width: 0; } .bk .t { font-weight: bold; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .bk .m { font-size: 12px; color: #999; margin-top: 2px; } a { color: #1677ff; text-decoration: none; } a:hover { text-decoration: underline; } .co { color: #999; } .btn { padding: 8px 20px; background: #1677ff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; margin: 2px; } .bb2 { background: #fff; color: #1677ff; border: 1px solid #1677ff; } .detail { background: #fff; border-radius: 12px; padding: 24px; max-width: 800px; margin: 0 auto; box-shadow: 0 2px 12px rgba(0,0,0,0.1); overflow: hidden; } .detail h1 { margin-bottom: 16px; font-size: 22px; margin-right: 170px; } .detail .meta { margin-bottom: 16px; color: #666; font-size: 14px; line-height: 1.8; margin-right: 170px; } .detail .sec { margin: 16px 0; } .detail-cover { float: right; width: 150px; height: 200px; object-fit: contain; border-radius: 8px; background: #f5f5f5; margin-left: 16px; } .detail-cv { float: right; width: 150px; height: 200px; border-radius: 8px; background: linear-gradient(135deg, #667eea, #764ba2); display: flex; align-items: center; justify-content: center; color: #fff; font-size: 48px; margin-left: 16px; }"""
 
-NAV = '<nav><h2>📚 我的图书馆</h2><a href="/">🏠 首页</a><a href="/?p=books">📖 书库 ({B})</a><a href="/?p=media">🎧 媒体库 ({M})</a><a href="/?p=import">📥 导入新书</a></nav>'
+NAV = '<nav><h2>📚 我的图书馆</h2><a href="/">🏠 首页</a><a href="/?p=books">📖 书库 ({B})</a><a href="/?p=media">🎧 媒体库 ({M})</a><a href="/?p=import">📥 导入新书</a><div class="cat-tree">{TREE}</div></nav>'
+
+EXTRA_CSS = """
+.cat-tree{padding:8px 0 14px;border-top:1px solid #f0f0f0;margin-top:6px;max-height:calc(100vh - 220px);overflow-y:auto}
+.cat-tree .ci{margin:1px 0}
+.cat-tree .cl{display:block;padding:7px 20px;color:#333;text-decoration:none;font-size:14px;cursor:pointer}
+.cat-tree .cl:hover,.cat-tree .cl.act{background:#e6f4ff;color:#1677ff}
+.cat-tree .cl .ct{float:right;color:#bbb;font-size:12px}
+.cat-tree .sl{display:none;padding:2px 0 4px 12px}
+.cat-tree .sl.open{display:block}
+.cat-tree .sl a{display:block;padding:5px 20px 5px 30px;color:#666;text-decoration:none;font-size:13px}
+.cat-tree .sl a:hover,.cat-tree .sl a.act{background:#f0f5ff;color:#1677ff}
+.grid{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px}
+.card{width:116px;text-decoration:none;color:inherit;display:block}
+.card img,.card .cv{width:116px;height:162px;object-fit:cover;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,.12);background:linear-gradient(135deg,#667eea,#764ba2)}
+.card .cv{display:flex;align-items:center;justify-content:center;color:#fff;font-size:28px}
+.card .t{font-size:12px;margin-top:6px;line-height:1.35;height:32px;overflow:hidden}
+"""
+
+def build_cat_tree(active_cat='', active_sub=''):
+    # 一级分类（名称/排序）
+    cats = dbq("SELECT id,name,sort_order FROM categories WHERE parent_id IS NULL ORDER BY sort_order,name")
+    # 二级分类
+    subs_all = dbq("SELECT id,name,parent_id FROM categories WHERE parent_id IS NOT NULL")
+    # 计数：INNER JOIN books 且 status='active'。
+    # 注意：原 LEFT JOIN books ON ... AND b.status='active' 写法在 12GB 库上会触发 SQLite C 扩展崩溃（exit 1，无 traceback），
+    # 故改为 INNER JOIN 聚合后于 Python 侧映射计数，安全且只统计 active 书。
+    cat_n = {}
+    for r in dbq("SELECT bc.category_id cid, COUNT(*) n FROM book_categories bc JOIN books b ON b.id=bc.book_id WHERE b.status='active' GROUP BY bc.category_id"):
+        cat_n[r['cid']] = r['n']
+    sub_n = {}
+    for r in dbq("SELECT bc.subcategory_id sid, COUNT(*) n FROM book_categories bc JOIN books b ON b.id=bc.book_id WHERE b.status='active' AND bc.subcategory_id IS NOT NULL GROUP BY bc.subcategory_id"):
+        sub_n[r['sid']] = r['n']
+    subs = {}
+    for r in subs_all:
+        subs.setdefault(r['parent_id'], []).append((r['id'], r['name'], sub_n.get(r['id'], 0)))
+    out = ['<div class="cat-tree">']
+    for c in cats:
+        cid = c['id']; act = ' act' if cid == active_cat else ''
+        n = cat_n.get(cid, 0)
+        out.append('<div class="ci"><a class="cl%s" href="/?p=books&cat=%s">%s<span class="ct">%s</span></a>' % (act, cid, he(c['name']), n))
+        sl = subs.get(cid, [])
+        if sl:
+            opencls = ' open' if cid == active_cat else ''
+            out.append('<div class="sl%s">' % opencls)
+            for sid, sn, sn_n in sl:
+                sa = ' act' if sid == active_sub else ''
+                out.append('<a class="%s" href="/?p=books&cat=%s&sub=%s">%s <span style="color:#bbb">(%s)</span></a>' % (sa, cid, sid, he(sn), sn_n))
+            out.append('</div>')
+        out.append('</div>')
+    out.append('</div>')
+    return ''.join(out)
 
 COMMON_JS = """<script>
 function EDT(id,old){var t=prompt("新书名:",old);if(t&&t!==old){var x=new XMLHttpRequest();x.open("POST","/api/books/"+id+"/edit");x.setRequestHeader("Content-Type","application/json");x.onload=function(){location.reload()};x.send(JSON.stringify({title:t}));}}
@@ -617,26 +668,54 @@ def run_extract_async(count=10):
     threading.Thread(target=w,daemon=True).start()
     return {"status":"started"}
 
+def _get_taxonomy():
+    """从 categories 表构建 一级->[二级] 映射"""
+    try:
+        rows = dbq("SELECT c.name, s.name FROM categories s JOIN categories c ON s.parent_id=c.id WHERE s.parent_id IS NOT NULL")
+        tax = {}
+        for cat, sub in rows:
+            tax.setdefault(cat, []).append(sub)
+        return tax
+    except Exception:
+        return {}
+
 def run_classify_async(count=10):
     if _task_status.get('cr'): return {"status":"running"}
     _task_status['cr'] = True
     _task_status['cr_r'] = {"done":0,"total":0}
     def w():
         try:
-            books = dbq("SELECT id,title,text_content FROM books WHERE status='active' AND id NOT IN (SELECT book_id FROM book_categories) LIMIT ?",(int(count),))
-            cats = ["计算机与编程","历史与人文","文学与小说","哲学与思想","科学与科普","经济与管理","心理与成长","教育学习","艺术设计","社会与政治","生活与健康"]
+            # 取“无分类”或“有分类但缺二级”的书
+            books = dbq("SELECT id,title,text_content FROM books WHERE status='active' AND id NOT IN (SELECT book_id FROM book_categories WHERE subcategory_id IS NOT NULL) LIMIT ?",(int(count),))
+            tax = _get_taxonomy()
+            cats = list(tax.keys()) if tax else ["计算机与编程","历史与人文","文学与小说","哲学与思想","科学与科普","经济与管理","心理与成长","教育学习","艺术设计","社会与政治","生活与健康","其他"]
+            clist_lines = []
+            for c in cats:
+                clist_lines.append("- " + c)
+                for s in tax.get(c, []):
+                    clist_lines.append("    - " + s)
+            clist = "\n".join(clist_lines)
             rv = {"done":0,"total":len(books)}
             for b in books:
                 try:
-                    clist="\n".join("- "+c for c in cats)
-                    prompt=f"判断以下书籍类别。可选类别：\n{clist}\n\n书名：{b['title']}\n内容：{(b['text_content'] or '')[:1500]}\n只返回JSON：{{\"category\":\"类别名\",\"tags\":[\"标签1\",\"标签2\"],\"difficulty\":\"入门/中级/高级\"}}"
+                    prompt=f"判断以下书籍分类。一级类别与二级子类只能从下列选择。\n{clist}\n\n书名：{b['title']}\n内容：{(b['text_content'] or '')[:1500]}\n（若内容为空，仅根据书名判断）\n只返回JSON：{{\"category\":\"一级类别名\",\"subcategory\":\"二级子类名（必须属于所选一级）\",\"tags\":[\"标签1\",\"标签2\"],\"difficulty\":\"入门/中级/高级\"}}"
                     resp=_ollama_generate(prompt, model="qwen2.5:7b", timeout=180, temperature=0.1, num_ctx=4096)
                     if resp.startswith("```"): resp=resp.split("\n",1)[1].rsplit("\n",1)[0]
                     result=json.loads(resp)
                     cn=result.get("category","其他")
                     cr=dbq("SELECT id FROM categories WHERE name=?",(cn,))
                     cid=cr[0]['id'] if cr else str(uuid.uuid4()); dbe("INSERT INTO categories(id,name) VALUES(?,?)",(cid,cn)) if not cr else None
-                    dbe("INSERT OR IGNORE INTO book_categories(book_id,category_id) VALUES(?,?)",(b['id'],cid))
+                    if not dbq("SELECT 1 FROM book_categories WHERE book_id=?",(b['id'],)):
+                        dbe("INSERT INTO book_categories(book_id,category_id) VALUES(?,?)",(b['id'],cid))
+                    sn=result.get("subcategory")
+                    sid=None
+                    if sn:
+                        sr=dbq("SELECT id FROM categories WHERE name=? AND parent_id=?",(sn,cid))
+                        if sr: sid=sr[0]['id']
+                        else:
+                            sid=str(uuid.uuid4()); dbe("INSERT INTO categories(id,name,parent_id) VALUES(?,?,?)",(sid,sn,cid))
+                    if sid:
+                        dbe("UPDATE book_categories SET subcategory_id=? WHERE book_id=?",(sid,b['id']))
                     for tn in result.get("tags",[]):
                         tr=dbq("SELECT id FROM tags WHERE name=?",(tn,))
                         tid=tr[0]['id'] if tr else str(uuid.uuid4()); dbe("INSERT INTO tags(id,name) VALUES(?,?)",(tid,tn)) if not tr else None
@@ -1309,29 +1388,37 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
         ct=get_counts()  # 同步刷新统计，确保导入后首页立即显示正确数字
         tb=ct.get('tb',0); tm=ct.get('tm',0)
         pn=qs.get('p',['home'])[0]
-        nv=NAV.replace('{B}',str(tb)).replace('{M}',str(tm))
-        h='<!DOCTYPE html><html><head><meta charset=utf-8><title>我的图书馆</title><style>'+CSS+'</style></head><body>'+nv+'<main>'
+        cat=qs.get('cat',[''])[0]; sub=qs.get('sub',[''])[0]
+        nv=NAV.replace('{B}',str(tb)).replace('{M}',str(tm)).replace('{TREE}', build_cat_tree(cat, sub))
+        h='<!DOCTYPE html><html><head><meta charset=utf-8><title>我的图书馆</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>'+CSS+EXTRA_CSS+'</style></head><body>'+nv+'<main>'
         if pn=='books':
-            q=qs.get('q',[''])[0];cat=qs.get('cat',[''])[0];fmt=qs.get('fmt',[''])[0];bp=int(qs.get('page',['1'])[0])
+            q=qs.get('q',[''])[0];cat=qs.get('cat',[''])[0];sub=qs.get('sub',[''])[0];fmt=qs.get('fmt',[''])[0];bp=int(qs.get('page',['1'])[0])
             s="SELECT id,title,file_format,file_size,cover_path FROM books WHERE status='active'";pa=[]
             if q:s+=" AND title LIKE ?";pa.append('%'+q+'%')
             if cat:s+=" AND id IN (SELECT book_id FROM book_categories WHERE category_id=?)";pa.append(cat)
+            if sub:s+=" AND id IN (SELECT book_id FROM book_categories WHERE subcategory_id=?)";pa.append(sub)
             if fmt:s+=" AND file_format=?";pa.append(fmt)
             total=dbq("SELECT count(*)as c FROM books WHERE "+s.split("WHERE",1)[1],tuple(pa))[0]['c']
             s+=" ORDER BY created_at DESC, title ASC LIMIT 20 OFFSET "+str((bp-1)*20)
             rows=dbq(s,tuple(pa))
-            h+='<h2>📖 书库'+(' - '+fmt.upper() if fmt else '')+' ('+str(len(rows))+'/'+str(total)+')</h2>'
-            h+='<form class=sch method=get><input type=hidden name=p value=books><input type=hidden name=fmt value="'+he(fmt)+'"><input name=q placeholder=搜索书名 value="'+he(q)+'"><select name=cat><option value="">全部分类</option>'
+            subname=''
+            if sub:
+                sr=dbq("SELECT name FROM categories WHERE id=?",(sub,))
+                if sr:subname=' › '+sr[0]['name']
+            h+='<h2>📖 书库'+(' - '+fmt.upper() if fmt else '')+subname+' ('+str(len(rows))+'/'+str(total)+')</h2>'
+            h+='<form class=sch method=get><input type=hidden name=p value=books><input type=hidden name=fmt value="'+he(fmt)+'"><input type=hidden name=sub value="'+he(sub)+'"><input name=q placeholder=搜索书名 value="'+he(q)+'"><select name=cat><option value="">全部分类</option>'
             for r in dbq("SELECT id,name FROM categories ORDER BY name"):
                 sel=' selected'if r['id']==cat else''
                 h+='<option value="'+r['id']+'"'+sel+'>'+he(r['name'])+'</option>'
             h+='</select><button>搜索</button></form>'
+            h+='<div class=grid>'
             for r in rows:
-                cv='<img src="/api/covers/'+r['id']+'.jpg">'if r['cover_path']else'<div class=cv>📚</div>'
-                h+='<div class=bk onclick="location.href=\'/?p=detail&id='+r['id']+'\'"><a href="/?p=detail&id='+r['id']+'" onclick="event.stopPropagation()">'+cv+'</a><div class=info><div class=t>'+he(r['title'])[:60]+'</div><div class=m>'+r['file_format'].upper()+' '+str(round(r['file_size']/1024/1024,1))+'MB</div></div></div>'
+                cv='<img src="/api/covers/'+r['id']+'.jpg" alt="">'if r['cover_path']else'<div class=cv>📚</div>'
+                h+='<a class=card href="/?p=detail&id='+r['id']+'">'+cv+'<div class=t>'+he(r['title'])[:44]+'</div></a>'
+            h+='</div>'
             if total>20:
                 tp=(total+19)//20;qs_str=""
-                if q or cat or fmt:qs_str="&q="+he(q)+"&cat="+(cat or"")+"&fmt="+(fmt or"")
+                if q or cat or sub or fmt:qs_str="&q="+he(q)+"&cat="+(cat or"")+"&sub="+(sub or"")+"&fmt="+(fmt or"")
                 h+='<div style=text-align:center;margin-top:12px;font-size:14px>共 '+str(total)+' 本 页 '+str(bp)+'/'+str(tp)+' '
                 if bp>1:h+='<a href="?p=books&page='+str(bp-1)+qs_str+'">上一页</a> '
                 if bp<tp:h+='<a href="?p=books&page='+str(bp+1)+qs_str+'">下一页</a> '
