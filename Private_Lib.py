@@ -93,6 +93,8 @@ EXTRA_CSS = """
 .cat-tree .cl{display:block;padding:7px 20px;color:#333;text-decoration:none;font-size:14px;cursor:pointer}
 .cat-tree .cl:hover,.cat-tree .cl.act{background:#e6f4ff;color:#1677ff}
 .cat-tree .cl .ct{float:right;color:#bbb;font-size:12px}
+.cat-tree .cl .caret{display:inline-block;width:13px;color:#999;cursor:pointer;user-select:none;font-size:11px;margin-right:2px}
+.cat-tree .cl .caret:hover{color:#1677ff}
 .cat-tree .sl{display:none;padding:2px 0 4px 12px}
 .cat-tree .sl.open{display:block}
 .cat-tree .sl a{display:block;padding:5px 20px 5px 30px;color:#666;text-decoration:none;font-size:13px}
@@ -125,10 +127,11 @@ def build_cat_tree(active_cat='', active_sub=''):
     for c in cats:
         cid = c['id']; act = ' act' if cid == active_cat else ''
         n = cat_n.get(cid, 0)
-        out.append('<div class="ci"><a class="cl%s" href="/?p=books&cat=%s">%s<span class="ct">%s</span></a>' % (act, cid, he(c['name']), n))
         sl = subs.get(cid, [])
+        opencls = ' open' if (sl and cid == active_cat) else ''
+        caret = '▾' if opencls else '▸'
+        out.append('<div class="ci"><a class="cl%s" href="/?p=books&cat=%s"><span class="caret" onclick="toggleCat(event)">%s</span>%s<span class="ct">%s</span></a>' % (act, cid, caret, he(c['name']), n))
         if sl:
-            opencls = ' open' if cid == active_cat else ''
             out.append('<div class="sl%s">' % opencls)
             for sid, sn, sn_n in sl:
                 sa = ' act' if sid == active_sub else ''
@@ -140,6 +143,17 @@ def build_cat_tree(active_cat='', active_sub=''):
 
 COMMON_JS = """<script>
 function EDT(id,old){var t=prompt("新书名:",old);if(t&&t!==old){var x=new XMLHttpRequest();x.open("POST","/api/books/"+id+"/edit");x.setRequestHeader("Content-Type","application/json");x.onload=function(){location.reload()};x.send(JSON.stringify({title:t}));}}
+function toggleCat(e){
+  e.preventDefault(); e.stopPropagation();
+  var a=this.parentElement;            // .cl 链接
+  var ci=a.parentElement;              // .ci 容器
+  var sl=ci.querySelector('.sl');
+  if(sl){
+    sl.classList.toggle('open');
+    var cr=a.querySelector('.caret');
+    if(cr) cr.textContent = sl.classList.contains('open') ? '▾' : '▸';
+  }
+}
 var _clsTimer=null,_sumTimer=null;
 function CLS(){
   var b=document.getElementById("clsBtn");if(b.disabled)return;
@@ -1392,14 +1406,14 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
         nv=NAV.replace('{B}',str(tb)).replace('{M}',str(tm)).replace('{TREE}', build_cat_tree(cat, sub))
         h='<!DOCTYPE html><html><head><meta charset=utf-8><title>我的图书馆</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>'+CSS+EXTRA_CSS+'</style></head><body>'+nv+'<main>'
         if pn=='books':
-            q=qs.get('q',[''])[0];cat=qs.get('cat',[''])[0];sub=qs.get('sub',[''])[0];fmt=qs.get('fmt',[''])[0];bp=int(qs.get('page',['1'])[0])
+            q=qs.get('q',[''])[0];cat=qs.get('cat',[''])[0];sub=qs.get('sub',[''])[0];fmt=qs.get('fmt',[''])[0];bp=int(qs.get('page',['1'])[0]);ps=60
             s="SELECT id,title,file_format,file_size,cover_path FROM books WHERE status='active'";pa=[]
             if q:s+=" AND title LIKE ?";pa.append('%'+q+'%')
             if cat:s+=" AND id IN (SELECT book_id FROM book_categories WHERE category_id=?)";pa.append(cat)
             if sub:s+=" AND id IN (SELECT book_id FROM book_categories WHERE subcategory_id=?)";pa.append(sub)
             if fmt:s+=" AND file_format=?";pa.append(fmt)
             total=dbq("SELECT count(*)as c FROM books WHERE "+s.split("WHERE",1)[1],tuple(pa))[0]['c']
-            s+=" ORDER BY created_at DESC, title ASC LIMIT 20 OFFSET "+str((bp-1)*20)
+            s+=" ORDER BY created_at DESC, title ASC LIMIT "+str(ps)+" OFFSET "+str((bp-1)*ps)
             rows=dbq(s,tuple(pa))
             subname=''
             if sub:
@@ -1416,8 +1430,8 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
                 cv='<img src="/api/covers/'+r['id']+'.jpg" alt="">'if r['cover_path']else'<div class=cv>📚</div>'
                 h+='<a class=card href="/?p=detail&id='+r['id']+'">'+cv+'<div class=t>'+he(r['title'])[:44]+'</div></a>'
             h+='</div>'
-            if total>20:
-                tp=(total+19)//20;qs_str=""
+            if total>ps:
+                tp=(total+ps-1)//ps;qs_str=""
                 if q or cat or sub or fmt:qs_str="&q="+he(q)+"&cat="+(cat or"")+"&sub="+(sub or"")+"&fmt="+(fmt or"")
                 h+='<div style=text-align:center;margin-top:12px;font-size:14px>共 '+str(total)+' 本 页 '+str(bp)+'/'+str(tp)+' '
                 if bp>1:h+='<a href="?p=books&page='+str(bp-1)+qs_str+'">上一页</a> '
