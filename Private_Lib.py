@@ -79,13 +79,32 @@ def dbe(sql, params=()):
     c.commit()
     c.close()
 
+def migrate_schema():
+    """P0：阅读进度(reading_status/last_page) + 智能书架(shelves)。幂等，可在启动时安全重复调用。"""
+    c = sqlite3.connect(DB, timeout=30)
+    cur = c.cursor()
+    cols = {r[1] for r in cur.execute("PRAGMA table_info(books)").fetchall()}
+    for col, ddl in [
+        ("reading_status", "TEXT DEFAULT 'unread'"),
+        ("last_page", "INTEGER DEFAULT 0"),
+        ("last_read_at", "TEXT DEFAULT ''"),
+    ]:
+        if col not in cols:
+            cur.execute("ALTER TABLE books ADD COLUMN %s %s" % (col, ddl))
+    cur.execute("""CREATE TABLE IF NOT EXISTS shelves (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL,
+        q TEXT DEFAULT '', cat TEXT DEFAULT '', sub TEXT DEFAULT '',
+        fmt TEXT DEFAULT '', diff TEXT DEFAULT '', rstat TEXT DEFAULT '',
+        sort_order INTEGER DEFAULT 0)""")
+    c.commit(); c.close()
+
 def he(s): return str(s).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
 def fc(f): return {'pdf':'#ff4d4f','epub':'#1677ff','rar':'#fa8c16','mobi':'#52c41a','azw3':'#13c2c2','txt':'#1677ff','md':'#722ed1'}.get(f,'#999')
 def cc(c): return {'计算机与编程':'#1677ff','历史与人文':'#fa8c16','文学与小说':'#52c41a','哲学与思想':'#722ed1','科学与科普':'#13c2c2','经济与管理':'#eb2f96','心理与成长':'#fa541c','教育学习':'#2f54eb','艺术设计':'#a0d911','社会与政治':'#f5222d','生活与健康':'#7cb305','其他':'#999'}.get(c,'#999')
 
 CSS = """* { margin:0; padding:0; box-sizing:border-box; } body { font-family: "Microsoft YaHei", Arial, sans-serif; background: #f5f5f5; display: flex; min-height: 100vh; } nav { width: 250px; background: #fff; padding: 20px 0; box-shadow: 2px 0 8px rgba(0,0,0,0.05); } nav h2 { padding: 0 20px 20px; color: #1677ff; font-size: 18px; border-bottom: 1px solid #f0f0f0; margin-bottom: 10px; } nav a { display: block; padding: 12px 20px; color: #333; text-decoration: none; font-size: 15px; } nav a:hover { background: #e6f4ff; color: #1677ff; } main { flex: 1; padding: 24px; overflow-y: auto; } .sb { background: #fff; padding: 20px; border-radius: 8px; text-align: center; min-width: 140px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); text-decoration: none; color: inherit; } .sb .n { font-size: 28px; font-weight: bold; } .sb .l { font-size: 13px; color: #999; margin-top: 4px; } .row { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; } .tag { display: inline-block; padding: 3px 10px; border-radius: 4px; font-size: 12px; margin: 3px; color: #fff; } .panel { background: #fff; padding: 16px; border-radius: 8px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); } .panel h3 { margin-bottom: 12px; font-size: 16px; } .sch { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; } .sch input, .sch select { padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; } .sch input { flex: 1; min-width: 180px; } .sch button { padding: 8px 20px; background: #1677ff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; } .bk { background: #fff; border-radius: 8px; padding: 14px; margin-bottom: 8px; display: flex; gap: 12px; align-items: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05); cursor: pointer; } .bk:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.1); } .bk img { width: 50px; height: 70px; object-fit: cover; border-radius: 4px; flex-shrink: 0; } .bk .cv { width: 50px; height: 70px; border-radius: 4px; flex-shrink: 0; background: linear-gradient(135deg, #667eea, #764ba2); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 22px; } .bk .info { flex: 1; min-width: 0; } .bk .t { font-weight: bold; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .bk .m { font-size: 12px; color: #999; margin-top: 2px; } a { color: #1677ff; text-decoration: none; } a:hover { text-decoration: underline; } .co { color: #999; } .btn { padding: 8px 20px; background: #1677ff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; margin: 2px; } .bb2 { background: #fff; color: #1677ff; border: 1px solid #1677ff; } .detail { background: #fff; border-radius: 12px; padding: 24px; max-width: 800px; margin: 0 auto; box-shadow: 0 2px 12px rgba(0,0,0,0.1); overflow: hidden; } .detail h1 { margin-bottom: 16px; font-size: 22px; margin-right: 170px; } .detail .meta { margin-bottom: 16px; color: #666; font-size: 14px; line-height: 1.8; margin-right: 170px; } .detail .sec { margin: 16px 0; } .detail-cover { float: right; width: 150px; height: 200px; object-fit: contain; border-radius: 8px; background: #f5f5f5; margin-left: 16px; } .detail-cv { float: right; width: 150px; height: 200px; border-radius: 8px; background: linear-gradient(135deg, #667eea, #764ba2); display: flex; align-items: center; justify-content: center; color: #fff; font-size: 48px; margin-left: 16px; }"""
 
-NAV = '<nav><h2>📚 我的图书馆</h2><a href="/">🏠 首页</a><a href="/?p=books">📖 书库 ({B})</a><a href="/?p=media">🎧 媒体库 ({M})</a><a href="/?p=import">📥 导入新书</a><div class="cat-tree">{TREE}</div></nav>'
+NAV = '<nav><h2>📚 我的图书馆</h2><a href="/">🏠 首页</a><a href="/?p=books">📖 书库 ({B})</a><a href="/?p=media">🎧 媒体库 ({M})</a><a href="/?p=import">📥 导入新书</a><div class="cat-tree">{TREE}</div><div class="shelf-box">{SHELVES}</div></nav>'
 
 EXTRA_CSS = """
 .cat-tree{padding:8px 0 14px;border-top:1px solid #f0f0f0;margin-top:6px;max-height:calc(100vh - 220px);overflow-y:auto}
@@ -97,6 +116,22 @@ EXTRA_CSS = """
 .cat-tree .cl .caret:hover{color:#1677ff}
 .cat-tree .clink{color:inherit;text-decoration:none}
 .cat-tree .clink:hover{color:#1677ff}
+.shelf-box{padding:6px 0 14px;border-top:1px solid #f0f0f0;margin-top:6px}
+.shelf-box .sb-h{padding:6px 20px;color:#999;font-size:12px;font-weight:bold;display:flex;align-items:center;justify-content:space-between}
+.shelf-box .sb-h a{color:#1677ff;text-decoration:none;font-weight:normal}
+.shelf-box .shelf{display:flex;align-items:center;padding:6px 20px;color:#333;text-decoration:none;font-size:14px}
+.shelf-box .shelf:hover{background:#f0f5ff;color:#1677ff}
+.shelf-box .shelf .sn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.shelf-box .shelf .sd{color:#bbb;cursor:pointer;margin-left:8px;font-size:12px}
+.shelf-box .shelf .sd:hover{color:#ff4d4f}
+.shelf-box .empty{color:#bbb;font-size:12px;padding:4px 20px}
+.rb{display:inline-block;font-size:11px;padding:1px 6px;border-radius:10px;margin-top:4px;color:#fff}
+.rb.unread{background:#bbb}
+.rb.reading{background:#1677ff}
+.rb.finished{background:#52c41a}
+.sb-btn{background:#fff!important;color:#1677ff;border:1px solid #1677ff!important}
+.rs-btn{background:#1677ff;color:#fff;border:1px solid #1677ff;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:13px;margin-left:6px}
+.rs-btn.off{background:#fff;color:#888;border-color:#ccc}
 .cat-tree .sl{display:none;padding:2px 0 4px 12px}
 .cat-tree .sl.open{display:block}
 .cat-tree .sl a{display:block;padding:5px 20px 5px 30px;color:#666;text-decoration:none;font-size:13px}
@@ -149,6 +184,20 @@ def build_cat_tree(active_cat='', active_sub=''):
             out.append('</div>')
         out.append('</div>')
     out.append('</div>')
+    return ''.join(out)
+
+def build_shelves():
+    rows = dbq("SELECT id,name,q,cat,sub,fmt,diff,rstat FROM shelves ORDER BY sort_order,name")
+    if not rows:
+        return '<div class="sb-h">📑 我的书架 <a href="/?p=books" title="去书库页保存">＋</a></div><div class="empty">暂无书架，在书库页点「存为书架」</div>'
+    out = ['<div class="sb-h">📑 我的书架 <a href="/?p=books" title="去书库页保存">＋</a></div>']
+    for r in rows:
+        qs = []
+        for k,v in (('q',r['q']),('cat',r['cat']),('sub',r['sub']),('fmt',r['fmt']),('diff',r['diff']),('rstat',r['rstat'])):
+            if v: qs.append('%s=%s' % (k, he(str(v))))
+        href = '/?p=books' + ('&'+'&'.join(qs) if qs else '')
+        out.append('<div class="shelf"><a class="sn" href="%s" title="%s">%s</a><span class="sd" onclick="delShelf(\'%s\')" title="删除">✕</span></div>'
+                   % (href, he(r['name']), he(r['name']), r['id']))
     return ''.join(out)
 
 COMMON_JS = """<script>
@@ -324,6 +373,35 @@ function DELM(id,title){
   x.onload=function(){try{var r=JSON.parse(x.responseText);if(r.ok){alert("已删除");location.href="/?p=media";}else alert("删除失败: "+(r.error||"未知错误"));}catch(e){alert("删除失败")}};
   x.onerror=function(){alert("删除失败：网络错误")};
   x.send("{}");
+}
+
+// P0 阅读状态
+function setStatus(bid,st){
+  var x=new XMLHttpRequest();x.open("POST","/api/progress");x.setRequestHeader("Content-Type","application/json");
+  x.onload=function(){location.reload();};
+  x.onerror=function(){alert("更新失败");};
+  x.send(JSON.stringify({id:bid,status:st,page:0}));
+}
+// P0 智能书架：保存当前筛选
+function saveShelf(){
+  var q=document.querySelector('input[name=q]').value;
+  var cat=document.querySelector('select[name=cat]').value;
+  var sub=document.querySelector('input[name=sub]').value;
+  var fmt=document.querySelector('input[name=fmt]').value;
+  var diff=document.querySelector('select[name=diff]').value;
+  var rstat=document.querySelector('select[name=rstat]').value;
+  var name=prompt("书架名称：", (cat?cat+' ':'')+(rstat?rstat+' ':'')+(diff?diff+' ':'').trim()||"我的书架");
+  if(!name)return;
+  var x=new XMLHttpRequest();x.open("POST","/api/shelves");x.setRequestHeader("Content-Type","application/json");
+  x.onload=function(){var r=JSON.parse(x.responseText);if(r.ok){alert("已保存书架："+name);location.reload();}else alert("保存失败");};
+  x.send(JSON.stringify({name:name,q:q,cat:cat,sub:sub,fmt:fmt,diff:diff,rstat:rstat}));
+}
+// P0 删除书架
+function delShelf(id){
+  if(!confirm("删除这个书架？"))return;
+  var x=new XMLHttpRequest();x.open("POST","/api/shelves/delete");x.setRequestHeader("Content-Type","application/json");
+  x.onload=function(){location.reload();};
+  x.send(JSON.stringify({id:id}));
 }
 
 </script>"""
@@ -1108,6 +1186,26 @@ class H(http.server.SimpleHTTPRequestHandler):
                 _count_cache["time"]=0
                 self.json({"ok":True}); return
 
+            # P0 阅读进度：记录 未读/在读/读完 + 当前页
+            if path == "/api/progress":
+                bid=data.get('id',''); st=data.get('status','reading'); pg=int(data.get('page',0) or 0)
+                if bid and st in ('unread','reading','finished'):
+                    dbe("UPDATE books SET reading_status=?, last_page=?, last_read_at=datetime('now') WHERE id=?",(st, pg, bid))
+                    self.json({"ok":True}); return
+                self.json({"error":"invalid"}); return
+            # P0 智能书架：保存当前筛选组合
+            if path == "/api/shelves":
+                name=(data.get('name','') or '').strip()
+                if not name: self.json({"error":"name empty"}); return
+                sid=str(uuid.uuid4())
+                dbe("INSERT INTO shelves(id,name,q,cat,sub,fmt,diff,rstat) VALUES(?,?,?,?,?,?,?,?)",
+                    (sid, name, data.get('q','') or '', data.get('cat','') or '', data.get('sub','') or '',
+                     data.get('fmt','') or '', data.get('diff','') or '', data.get('rstat','') or ''))
+                self.json({"ok":True,"id":sid}); return
+            if path == "/api/shelves/delete":
+                dbe("DELETE FROM shelves WHERE id=?",(data.get('id',''),))
+                self.json({"ok":True}); return
+
             self.send_error(404)
         except Exception as e: self.send_error(500, str(e))
    
@@ -1344,6 +1442,14 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
 });
 </script>
 </body></html>'''
+                        # P0 阅读进度：从 last_page 续读 + 翻页自动保存
+                        _pr = dbq("SELECT reading_status,last_page FROM books WHERE id=?",(bid,))
+                        _lp = _pr[0]['last_page'] if (_pr and _pr[0]['last_page']) else 1
+                        viewer = viewer.replace(
+                            "var pdfDoc=null,pageNum=1,pageRendering=false,pendingPage=null,scale=1.2;",
+                            "var pdfDoc=null,pageNum=%d,BOOK_ID='%s',pageRendering=false,pendingPage=null,scale=1.2;\nvar _saveT=null;\nfunction saveProgress(p,st){if(_saveT)clearTimeout(_saveT);_saveT=setTimeout(function(){var x=new XMLHttpRequest();x.open('POST','/api/progress');x.setRequestHeader('Content-Type','application/json');x.send(JSON.stringify({id:BOOK_ID,status:st||'reading',page:p}));},800);}\n" % (_lp, bid))
+                        viewer = viewer.replace("renderPage(1);", "renderPage(Math.min(%d,pdfDoc.numPages)||1);" % _lp)
+                        viewer = viewer.replace("  document.getElementById('pageNum').value=n;", "  document.getElementById('pageNum').value=n;\n  saveProgress(n);")
                         self.send_response(200)
                         self.send_header("Content-Type", "text/html; charset=utf-8")
                         self.end_headers()
@@ -1410,15 +1516,19 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
         tb=ct.get('tb',0); tm=ct.get('tm',0)
         pn=qs.get('p',['home'])[0]
         cat=qs.get('cat',[''])[0]; sub=qs.get('sub',[''])[0]
-        nv=NAV.replace('{B}',str(tb)).replace('{M}',str(tm)).replace('{TREE}', build_cat_tree(cat, sub))
+        nv=NAV.replace('{B}',str(tb)).replace('{M}',str(tm)).replace('{TREE}', build_cat_tree(cat, sub)).replace('{SHELVES}', build_shelves())
         h='<!DOCTYPE html><html><head><meta charset=utf-8><title>我的图书馆</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>'+CSS+EXTRA_CSS+'</style></head><body>'+nv+'<main>'
         if pn=='books':
-            q=qs.get('q',[''])[0];cat=qs.get('cat',[''])[0];sub=qs.get('sub',[''])[0];fmt=qs.get('fmt',[''])[0];bp=int(qs.get('page',['1'])[0]);ps=85
-            s="SELECT id,title,file_format,file_size,cover_path FROM books WHERE status='active'";pa=[]
+            q=qs.get('q',[''])[0];cat=qs.get('cat',[''])[0];sub=qs.get('sub',[''])[0];fmt=qs.get('fmt',[''])[0]
+            diff=qs.get('diff',[''])[0];rstat=qs.get('rstat',[''])[0]
+            bp=int(qs.get('page',['1'])[0]);ps=85
+            s="SELECT id,title,file_format,file_size,cover_path,reading_status,last_page FROM books WHERE status='active'";pa=[]
             if q:s+=" AND title LIKE ?";pa.append('%'+q+'%')
             if cat:s+=" AND id IN (SELECT book_id FROM book_categories WHERE category_id=?)";pa.append(cat)
             if sub:s+=" AND id IN (SELECT book_id FROM book_categories WHERE subcategory_id=?)";pa.append(sub)
             if fmt:s+=" AND file_format=?";pa.append(fmt)
+            if diff:s+=" AND difficulty=?";pa.append(diff)
+            if rstat:s+=" AND reading_status=?";pa.append(rstat)
             total=dbq("SELECT count(*)as c FROM books WHERE "+s.split("WHERE",1)[1],tuple(pa))[0]['c']
             s+=" ORDER BY created_at DESC, title ASC LIMIT "+str(ps)+" OFFSET "+str((bp-1)*ps)
             rows=dbq(s,tuple(pa))
@@ -1427,19 +1537,35 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
                 sr=dbq("SELECT name FROM categories WHERE id=?",(sub,))
                 if sr:subname=' › '+sr[0]['name']
             h+='<h2>📖 书库'+(' - '+fmt.upper() if fmt else '')+subname+' ('+str(len(rows))+'/'+str(total)+')</h2>'
-            h+='<form class=sch method=get><input type=hidden name=p value=books><input type=hidden name=fmt value="'+he(fmt)+'"><input type=hidden name=sub value="'+he(sub)+'"><input name=q placeholder=搜索书名 value="'+he(q)+'"><select name=cat><option value="">全部分类</option>'
+            h+='<form class=sch method=get><input type=hidden name=p value=books><input type=hidden name=fmt value="'+he(fmt)+'"><input type=hidden name=sub value="'+he(sub)+'"><input name=q placeholder=搜索书名 value="'+he(q)+'">'
+            h+='<select name=cat><option value="">全部分类</option>'
             for r in dbq("SELECT id,name FROM categories ORDER BY name"):
                 sel=' selected'if r['id']==cat else''
                 h+='<option value="'+r['id']+'"'+sel+'>'+he(r['name'])+'</option>'
-            h+='</select><button>搜索</button></form>'
+            h+='</select>'
+            h+='<select name=rstat><option value="">全部状态</option>'
+            for v,l in (('unread','未读'),('reading','在读'),('finished','读完')):
+                sel=' selected'if v==rstat else''
+                h+='<option value="'+v+'"'+sel+'>'+l+'</option>'
+            h+='</select>'
+            h+='<select name=diff><option value="">全部难度</option>'
+            for v in ('入门','中级','高级'):
+                sel=' selected'if v==diff else''
+                h+='<option value="'+v+'"'+sel+'>'+v+'</option>'
+            h+='</select>'
+            h+='<button>搜索</button><button type=button class=sb-btn onclick="saveShelf()">💾 存为书架</button></form>'
             h+='<div class=grid>'
             for r in rows:
                 cv='<img src="/api/covers/'+r['id']+'.jpg" alt="">'if r['cover_path']else'<div class=cv>📚</div>'
-                h+='<a class=card href="/?p=detail&id='+r['id']+'">'+cv+'<div class=t>'+he(r['title'])[:44]+'</div></a>'
+                rb='';rs=r.get('reading_status') or 'unread';lp=r.get('last_page') or 0
+                if rs=='reading':rb='<span class="rb reading">在读'+(str(lp) if lp else '')+'</span>'
+                elif rs=='finished':rb='<span class="rb finished">读完✓</span>'
+                h+='<a class=card href="/?p=detail&id='+r['id']+'">'+cv+'<div class=t>'+he(r['title'])[:44]+'</div>'+rb+'</a>'
             h+='</div>'
             if total>ps:
                 tp=(total+ps-1)//ps;qs_str=""
-                if q or cat or sub or fmt:qs_str="&q="+he(q)+"&cat="+(cat or"")+"&sub="+(sub or"")+"&fmt="+(fmt or"")
+                if q or cat or sub or fmt or diff or rstat:
+                    qs_str="&q="+he(q)+"&cat="+(cat or"")+"&sub="+(sub or"")+"&fmt="+(fmt or"")+"&diff="+(diff or"")+"&rstat="+(rstat or"")
                 h+='<div style=text-align:center;margin-top:12px;font-size:14px>共 '+str(total)+' 本 页 '+str(bp)+'/'+str(tp)+' '
                 if bp>1:h+='<a href="?p=books&page='+str(bp-1)+qs_str+'">上一页</a> '
                 if bp<tp:h+='<a href="?p=books&page='+str(bp+1)+qs_str+'">下一页</a> '
@@ -1447,7 +1573,7 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
         elif pn=='detail':
             bid=qs.get('id',[None])[0];is_media=qs.get('type',[''])[0]=='media'
             if bid and not is_media:
-                r=dbq("SELECT id,title,subtitle,publisher,publish_date,isbn,language,description,cover_path,file_path,file_format,file_size,page_count,summary,summary_model,summary_updated,difficulty,status,created_at FROM books WHERE id=?",(bid,))
+                r=dbq("SELECT id,title,subtitle,publisher,publish_date,isbn,language,description,cover_path,file_path,file_format,file_size,page_count,summary,summary_model,summary_updated,difficulty,status,reading_status,last_page,created_at FROM books WHERE id=?",(bid,))
                 if r:
                     b=r[0];a=dbq("SELECT a.name FROM authors a JOIN book_authors ba ON a.id=ba.author_id WHERE ba.book_id=?",(bid,))
                     c=dbq("SELECT c.name FROM categories c JOIN book_categories bc ON c.id=bc.category_id WHERE bc.book_id=?",(bid,))
@@ -1460,6 +1586,13 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
                     if b['publisher']:h+='<p><b>出版社:</b> '+he(str(b['publisher']))+'</p>'
                     if b['isbn']:h+='<p><b>ISBN:</b> '+str(b['isbn'])+'</p>'
                     h+='</div><div style="clear:both"></div>'
+                    # 阅读状态控制（P0）
+                    rs=b.get('reading_status') or 'unread'; lp=b.get('last_page') or 0
+                    h+='<div class=sec><b>阅读状态:</b> '
+                    for v,l in (('unread','未读'),('reading','在读'),('finished','读完')):
+                        cls='rs-btn' if v==rs else 'rs-btn off'
+                        h+='<button class="'+cls+'" onclick="setStatus(\''+bid+'\',\''+v+'\')">'+l+'</button>'
+                    h+=' <span class=co id=rs-info>'+(('已读到第 '+str(lp)+' 页') if lp else '')+'</span></div>'
                     if c:
                         h+='<div class=sec>'
                         for x in c:h+='<span class=tag style=background:'+cc(x['name'])+'>'+he(x['name'])+'</span> '
@@ -1470,7 +1603,8 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
                     if b['summary']:h+='<div class=sec><h3>🤖 AI 摘要</h3><div style=white-space:pre-wrap;line-height:1.8;background:#f9f9f9;padding:16px;border-radius:8px;margin-top:8px>'+he(str(b['summary']))+'</div></div>'
                     else:h+='<div class=sec><p class=co>暂无摘要</p></div>'
                     read_url='/api/books/'+bid+'/'+('file'if b['file_format']=='pdf'else'read')
-                    h+='<div class=sec><a href="'+read_url+'" class=btn target=_blank>📖 阅读</a>'                                                                       #260727 修改 调用SumatraPDF
+                    cont = (' 续读第'+str(lp)+'页') if (b['file_format']=='pdf' and lp) else ''
+                    h+='<div class=sec><a href="'+read_url+'" class=btn target=_blank>📖 阅读'+cont+'</a>'                                                                       #260727 修改 调用SumatraPDF
                     h+=' <a href="#" class=btn onclick="event.preventDefault();fetch(\'/api/books/'+bid+'/open\')">📖 外部阅读</a>'
                     _jt=str(b['title']).replace('\\','\\\\').replace("'","\\'").replace('\n',' ')   #260816 删除按钮（标题做JS转义）
                     h+=' <a href="#" class=btn style="background:#ff4d4f;color:#fff" onclick="event.preventDefault();DELB(\''+bid+'\',\''+_jt+'\')">🗑️ 删除</a>'
@@ -1667,6 +1801,7 @@ def fix_drive_paths():
 
 if __name__ == "__main__":
     fix_drive_paths()
+    migrate_schema()
     HOST = os.environ.get("LIB_HOST", "127.0.0.1")
     PORT = int(os.environ.get("LIB_PORT", "8000"))
     print(f"🚀 http://localhost:{PORT}")
