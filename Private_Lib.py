@@ -141,6 +141,34 @@ EXTRA_CSS = """
 .card img,.card .cv{width:116px;height:162px;object-fit:cover;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,.12);background:linear-gradient(135deg,#667eea,#764ba2)}
 .card .cv{display:flex;align-items:center;justify-content:center;color:#fff;font-size:28px}
 .card .t{font-size:12px;margin-top:6px;line-height:1.35;height:32px;overflow:hidden}
+.topbar{display:none}
+.overlay{display:none}
+@media(max-width:768px){
+  body{display:block}
+  .topbar{display:flex;position:fixed;top:0;left:0;right:0;height:50px;align-items:center;gap:12px;padding:0 14px;background:#1677ff;color:#fff;z-index:1100;box-shadow:0 2px 6px rgba(0,0,0,.18)}
+  .topbar .menu-btn{background:transparent;border:none;color:#fff;font-size:24px;cursor:pointer;line-height:1;padding:2px 6px}
+  .topbar span{font-size:16px;font-weight:bold}
+  .overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:999}
+  body.nav-open .overlay{display:block}
+  nav{position:fixed;top:0;left:0;height:100vh;width:82%;max-width:300px;z-index:1000;transform:translateX(-100%);transition:transform .25s ease;overflow-y:auto;padding-top:58px;box-shadow:2px 0 12px rgba(0,0,0,.25)}
+  nav.open{transform:translateX(0)}
+  main{padding:62px 12px 16px;overflow:visible;height:auto}
+  .grid{gap:10px;margin-top:8px}
+  .card{width:calc(50% - 5px)}
+  .card img,.card .cv{width:100%;height:auto;aspect-ratio:116/162}
+  .card .t{font-size:11px;height:28px}
+  .sch{flex-direction:column;gap:8px}
+  .sch input,.sch select,.sch button{width:100%}
+  .sch input{min-width:0}
+  .detail-cover,.detail-cv{width:120px;height:168px;float:none;margin:0 0 12px}
+  .panel,.sb{padding:14px}
+  h2{font-size:18px}
+  .row{gap:10px}
+}
+@media(max-width:400px){
+  .card{width:calc(50% - 4px)}
+  .card .t{font-size:10px}
+}
 """
 
 def build_cat_tree(active_cat='', active_sub=''):
@@ -404,6 +432,7 @@ function delShelf(id){
   x.send(JSON.stringify({id:id}));
 }
 
+function toggleNav(){var n=document.querySelector('nav');if(!n)return;n.classList.toggle('open');document.body.classList.toggle('nav-open');}
 </script>"""
 
 def parse_multipart(content_type, body):
@@ -1517,7 +1546,7 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
         pn=qs.get('p',['home'])[0]
         cat=qs.get('cat',[''])[0]; sub=qs.get('sub',[''])[0]
         nv=NAV.replace('{B}',str(tb)).replace('{M}',str(tm)).replace('{TREE}', build_cat_tree(cat, sub)).replace('{SHELVES}', build_shelves())
-        h='<!DOCTYPE html><html><head><meta charset=utf-8><title>我的图书馆</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>'+CSS+EXTRA_CSS+'</style></head><body>'+nv+'<main>'
+        h='<!DOCTYPE html><html><head><meta charset=utf-8><title>我的图书馆</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>'+CSS+EXTRA_CSS+'</style></head><body>'+nv+'<div class="topbar"><button class="menu-btn" onclick="toggleNav()">☰</button><span>📚 我的图书馆</span></div><div class="overlay" onclick="toggleNav()"></div><main>'
         if pn=='books':
             q=qs.get('q',[''])[0];cat=qs.get('cat',[''])[0];sub=qs.get('sub',[''])[0];fmt=qs.get('fmt',[''])[0]
             diff=qs.get('diff',[''])[0];rstat=qs.get('rstat',[''])[0]
