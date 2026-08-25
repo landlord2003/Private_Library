@@ -1221,10 +1221,74 @@ def _sim(a, b):
     import difflib
     return difflib.SequenceMatcher(None, _clean_title(a), _clean_title(b)).ratio()
 
+def _http_get_text(url, timeout=8):
+    """标准库 urllib 发 GET 返回文本（用于 HTML 页面，如豆瓣详情页）。失败抛异常。"""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept-Language": "zh-CN,zh;q=0.9"})
+    proxy = _proxy_handler()
+    opener = urllib.request.build_opener(proxy)
+    with opener.open(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "ignore")
+
+
+def _douban_meta(title, author=None, isbn=None):
+    """豆瓣中文书元数据：subject_suggest 检索 + 详情页解析出版社/出版年/ISBN/简介。
+    返回标准 result dict 或 None。中文书命中率远高于 Open Library/Google，作为最高优先级源。"""
+    clean = _re_mod.sub(r'\((?:Z-?Library|z-?lib\.org|Z-?Libra[^)]*)\)', '', title or '', flags=_re_mod.I)
+    clean = _re_mod.sub(r'【[^】]*】', '', clean).strip()
+    short = (_re_mod.split(r'[（(—:：]', clean)[0].strip() or clean)
+    q = isbn or short
+    if not q: return None
+    try:
+        sug = _http_get_json("https://book.douban.com/j/subject_suggest?q=" + urllib.parse.quote(q), timeout=5)
+    except Exception as e:
+        print(f"[豆瓣检索失败] {title[:24]}: {e}", flush=True); return None
+    if not isinstance(sug, list) or not sug: return None
+    best = None; bs = -1.0
+    for it in sug:
+        if isbn and it.get("isbn") and it["isbn"].replace("-", "") == isbn.replace("-", ""):
+            best = it; bs = 1.0; break
+        sm = _sim(short, it.get("title", ""))
+        if sm > bs: bs = sm; best = it
+    if not best: return None
+    hid = best.get("id")
+    if not hid: return None
+    try:
+        h = _http_get_text("https://book.douban.com/subject/%s/" % hid, timeout=8)
+    except Exception as e:
+        print(f"[豆瓣详情失败] {title[:24]}: {e}", flush=True); return None
+    pub = _re_mod.search(r'出版社:</span>\s*<a[^>]*>([^<]+)</a>', h)
+    pub2 = _re_mod.search(r'出版社:</span>\s*([^<\n]+)', h)
+    yr = _re_mod.search(r'出版年:</span>\s*([^<\n]+)', h)
+    isbn_r = _re_mod.search(r'ISBN:</span>\s*([^<\n]+)', h)
+    intro = _re_mod.search(r'<div class="intro">\s*(.*?)</div>', h, _re_mod.S)
+    desc = _re_mod.sub(r'<[^>]+>', '', intro.group(1)).strip() if intro else ""
+    is_isbn_hit = bool(isbn and best.get("isbn") and best["isbn"].replace("-", "") == isbn.replace("-", ""))
+    sim = 1.0 if is_isbn_hit else max(0.9, bs)
+    return {
+        "publisher": (pub.group(1).strip() if pub else (pub2.group(1).strip() if pub2 else "")),
+        "publish_date": (yr.group(1).strip() if yr else ""),
+        "isbn": (isbn_r.group(1).strip() if isbn_r else (best.get("isbn") or "")),
+        "language": "zh",
+        "description": desc[:2000],
+        "source": "douban",
+        "sim": sim,
+    }
+
+
+def _proxy_handler():
+    """返回 urllib 代理处理器：优先 LIB_PROXY 环境变量，否则读系统/环境代理，皆无则直连。"""
+    p = os.environ.get("LIB_PROXY")
+    if p:
+        return urllib.request.ProxyHandler({"http": p, "https": p})
+    return urllib.request.ProxyHandler(urllib.request.getproxies())
+
+
 def _http_get_json(url, timeout=5):
     """标准库 urllib 发 GET，自动读取 HTTP_PROXY/HTTPS_PROXY 环境变量（复用 git 代理）。失败抛出异常（由调用方按场景处理）。"""
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (PrivateLib)"})
-    proxy = urllib.request.ProxyHandler(urllib.request.getproxies())
+    proxy = _proxy_handler()
     opener = urllib.request.build_opener(proxy)
     with opener.open(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8", "ignore"))
@@ -1244,7 +1308,14 @@ def fetch_online_metadata(title, author=None, isbn=None):
         return None
     result = None
     best_sim = 0.0
-    # 1) Open Library（主源，英文/知名书覆盖好；拉长超时应对国内网络抖动）
+    # 0) 豆瓣（中文书最高优先级；覆盖出版社/出版年/ISBN/简介，命中率高）
+    try:
+        dm = _douban_meta(title, author, isbn)
+        if dm and dm.get("sim", 0) >= 0.5:
+            result = dm
+    except Exception as e:
+        print(f"[豆瓣失败] {title[:30]}: {e}", flush=True)
+    # 1) Open Library（英文/知名书补充源；拉长超时应对国内网络抖动）
     try:
         ol = None
         if isbn:
@@ -1278,9 +1349,18 @@ def fetch_online_metadata(title, author=None, isbn=None):
             lang = ll[0] if ll else ""
             desc = ol.get("_desc") or (ol.get("description") if isinstance(ol.get("description"), str) else "")
             if isinstance(desc, dict): desc = desc.get("value","")
-            result = {"publisher": pub or "", "publish_date": str(pd) if pd else "",
-                      "isbn": isbn2 or "", "language": lang or "",
-                      "description": (desc or "")[:2000], "source": "openlibrary", "sim": best_sim}
+            if not result:
+                result = {"publisher": pub or "", "publish_date": str(pd) if pd else "",
+                          "isbn": isbn2 or "", "language": lang or "",
+                          "description": (desc or "")[:2000], "source": "openlibrary", "sim": best_sim}
+            else:
+                # 以豆瓣为主，Open Library 仅补全缺失字段
+                if not result.get("publisher"): result["publisher"] = pub or ""
+                if not result.get("publish_date"): result["publish_date"] = str(pd) if pd else ""
+                if not result.get("isbn"): result["isbn"] = isbn2 or ""
+                if not result.get("language"): result["language"] = lang or ""
+                if not result.get("description"): result["description"] = (desc or "")[:2000]
+                if best_sim > result.get("sim", 0): result["sim"] = best_sim
     except Exception as e:
         print(f"[OL失败] {title[:30]}: {e}", flush=True)
     # 2) Google Books 兜底（仅在 OL 无描述 且 未处于 429 冷却时调用，避免共享 IP 被限流）
