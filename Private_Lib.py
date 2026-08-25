@@ -6,7 +6,7 @@ from pathlib import Path
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
 # 在线元数据补全开关：默认关（离线优先、零依赖）。启用需设环境变量 LIB_METADATA_ONLINE=1 后重启。
-ENABLE_ONLINE_METADATA = os.environ.get("LIB_METADATA_ONLINE", "0") == "1"
+ENABLE_ONLINE_METADATA = os.environ.get("LIB_METADATA_ONLINE", "1") == "1"
 
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "library.db")
 _task_status = {}
@@ -1232,48 +1232,87 @@ def _http_get_text(url, timeout=8):
         return r.read().decode("utf-8", "ignore")
 
 
+# 书名后缀/修饰词，检索时应剥离以提高 subject_suggest 命中率
+_TITLE_SUFFIX = r'(丛书|全集|套书|套装|上下册|上册|下册|卷[一二三四五六七八九十百]+|第[0-9一二三四五六七八九十百]+版|含目录|扫描版|精装|修订版|增补版|译著|校订|注释|导读|图说|图鉴|简明|新版|影印|标点|校注|（中）|（上）|（下）)'
+
+def _title_query_variants(title):
+    """生成多个检索变体：去来源标记/括号 → 主标题 → 去后缀修饰词 → 取前N字。
+    subject_suggest 是书名前缀匹配接口，对长书名/丛书后缀极挑剔，多变体逐一尝试可大幅提升命中。"""
+    t = title or ''
+    t = _re_mod.sub(r'\((?:Z-?Library|z-?lib\.org|Z-?Libra[^)]*)\)', '', t, flags=_re_mod.I)
+    t = _re_mod.sub(r'【[^】]*】', '', t)
+    t = _re_mod.sub(r'[（(][^()（]*[）)]', '', t).strip()
+    head = _re_mod.split(r'[\s:：—-]', t)[0].strip() or t
+    vs = [head]
+    t2 = _re_mod.sub(_TITLE_SUFFIX + r'$', '', head).strip()
+    if t2 and t2 != head:
+        vs.append(t2)
+    for n in (12, 10, 8, 6, 4):
+        if len(head) >= n:
+            vs.append(head[:n])
+    seen = set(); out = []
+    for x in vs:
+        x = x.strip()
+        if x and x not in seen:
+            seen.add(x); out.append(x)
+    return out
+
 def _douban_meta(title, author=None, isbn=None):
-    """豆瓣中文书元数据：subject_suggest 检索 + 详情页解析出版社/出版年/ISBN/简介。
-    返回标准 result dict 或 None。中文书命中率远高于 Open Library/Google，作为最高优先级源。"""
-    clean = _re_mod.sub(r'\((?:Z-?Library|z-?lib\.org|Z-?Libra[^)]*)\)', '', title or '', flags=_re_mod.I)
-    clean = _re_mod.sub(r'【[^】]*】', '', clean).strip()
-    short = (_re_mod.split(r'[（(—:：]', clean)[0].strip() or clean)
-    q = isbn or short
-    if not q: return None
-    try:
-        sug = _http_get_json("https://book.douban.com/j/subject_suggest?q=" + urllib.parse.quote(q), timeout=5)
-    except Exception as e:
-        print(f"[豆瓣检索失败] {title[:24]}: {e}", flush=True); return None
-    if not isinstance(sug, list) or not sug: return None
-    best = None; bs = -1.0
-    for it in sug:
-        if isbn and it.get("isbn") and it["isbn"].replace("-", "") == isbn.replace("-", ""):
-            best = it; bs = 1.0; break
-        sm = _sim(short, it.get("title", ""))
-        if sm > bs: bs = sm; best = it
-    if not best: return None
+    """豆瓣中文书元数据：subject_suggest 多变体检索 + 详情页解析出版社/出版年/ISBN/简介。
+    返回标准 result dict（含 trusted 信任标志）或 None。中文书命中率远高于 Open Library/Google，作为最高优先级源。"""
+    best = None; best_sim = -1.0; matched_v = None
+    if isbn:
+        try:
+            sug = _http_get_json("https://book.douban.com/j/subject_suggest?q=" + urllib.parse.quote(isbn), timeout=5)
+            if isinstance(sug, list):
+                for it in sug:
+                    if it.get("isbn") and it["isbn"].replace("-", "") == isbn.replace("-", ""):
+                        best = it; best_sim = 1.0; matched_v = isbn; break
+        except Exception as e:
+            print(f"[豆瓣ISBN检索失败] {title[:24]}: {e}", flush=True)
+    if not best:
+        for v in _title_query_variants(title):
+            try:
+                sug = _http_get_json("https://book.douban.com/j/subject_suggest?q=" + urllib.parse.quote(v), timeout=5)
+            except Exception as e:
+                print(f"[豆瓣检索失败] {title[:24]}: {e}", flush=True); continue
+            if not isinstance(sug, list) or not sug:
+                continue
+            for it in sug:
+                sm = _sim(v, it.get("title", ""))
+                if sm > best_sim:
+                    best_sim = sm; best = it; matched_v = v
+            break  # 第一个有结果的变体即采用
+    if not best:
+        return None
     hid = best.get("id")
-    if not hid: return None
+    if not hid:
+        return None
     try:
         h = _http_get_text("https://book.douban.com/subject/%s/" % hid, timeout=8)
     except Exception as e:
         print(f"[豆瓣详情失败] {title[:24]}: {e}", flush=True); return None
     pub = _re_mod.search(r'出版社:</span>\s*<a[^>]*>([^<]+)</a>', h)
     pub2 = _re_mod.search(r'出版社:</span>\s*([^<\n]+)', h)
+    pub = pub.group(1).strip() if pub else (pub2.group(1).strip() if pub2 else "")
     yr = _re_mod.search(r'出版年:</span>\s*([^<\n]+)', h)
     isbn_r = _re_mod.search(r'ISBN:</span>\s*([^<\n]+)', h)
     intro = _re_mod.search(r'<div class="intro">\s*(.*?)</div>', h, _re_mod.S)
     desc = _re_mod.sub(r'<[^>]+>', '', intro.group(1)).strip() if intro else ""
     is_isbn_hit = bool(isbn and best.get("isbn") and best["isbn"].replace("-", "") == isbn.replace("-", ""))
-    sim = 1.0 if is_isbn_hit else max(0.9, bs)
+    bt = best.get("title", "")
+    # 信任判定：ISBN 命中 / 变体与返回书名互含 / 高相似度（避免短词模糊错配）
+    trusted = is_isbn_hit or (matched_v and (matched_v in bt or bt in matched_v)) or best_sim >= 0.6
+    sim = 1.0 if is_isbn_hit else best_sim
     return {
-        "publisher": (pub.group(1).strip() if pub else (pub2.group(1).strip() if pub2 else "")),
+        "publisher": pub,
         "publish_date": (yr.group(1).strip() if yr else ""),
         "isbn": (isbn_r.group(1).strip() if isbn_r else (best.get("isbn") or "")),
         "language": "zh",
         "description": desc[:2000],
         "source": "douban",
         "sim": sim,
+        "trusted": trusted,
     }
 
 
@@ -1442,7 +1481,7 @@ def run_metadata_async(count=None):
                     if meta:
                         sim = meta.get("sim", 0)
                         isbn_match = bool(b.get('isbn')) and meta.get("isbn") and b['isbn'].replace("-","")==meta["isbn"].replace("-","")
-                        trusted = isbn_match or sim >= 0.7 or (sim >= 0.55 and meta.get("description")) or (sim >= 0.6 and meta.get("publisher"))
+                        trusted = bool(meta.get("trusted")) or isbn_match or sim >= 0.7 or (sim >= 0.55 and meta.get("description")) or (sim >= 0.6 and meta.get("publisher"))
                         if trusted:
                             sets = []; params = []
                             for col in ("publisher","publish_date","isbn","language","description"):
@@ -2517,7 +2556,7 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             h+='<div style="margin-bottom:8px"><label style=font-size:13px>分类数量 </label><select id=clsCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=5>5 本</option><option value=10 selected>10 本</option><option value=20>20 本</option><option value=50>50 本</option><option value=100>100 本</option><option value=500>500 本</option><option value=1000>1000 本</option></select> <button class=btn id=clsBtn onclick="CLS()" style=margin-right:8px>🤖 AI 分类</button></div>'
             h+='<div style="margin-bottom:8px"><label style=font-size:13px>摘要数量 </label><select id=sumCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=1>1 本</option><option value=3 selected>3 本</option><option value=5>5 本</option><option value=10>10 本</option><option value=20>20 本</option><option value=100>100 本</option><option value=500>500 本</option><option value=1000>1000 本</option></select> <button class=btn id=sumBtn onclick="SUM()">🤖 AI 摘要</button></div>'
             h+='<div><label style=font-size:13px>提取数量 </label><select id=extCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=5>5 本</option><option value=10 selected>10 本</option><option value=20>20 本</option><option value=50>50 本</option><option value=100>100 本</option><option value=500>500 本</option><option value=1000>1000 本</option></select> <button class=btn id=extBtn onclick="EXT()">📄 提取文本</button></div>'
-            h+='<div style="margin:10px 0 4px;font-size:12px;color:#888;border-top:1px dashed #eee;padding-top:8px">🌐 在线元数据补全（需联网 Open Library / Google Books；默认未启用，设置 LIB_METADATA_ONLINE=1 重启后可用）</div>'
+            h+='<div style="margin:10px 0 4px;font-size:12px;color:#888;border-top:1px dashed #eee;padding-top:8px">🌐 在线元数据补全（主源豆瓣，中文书覆盖好；默认关，start.bat 已自动启用）</div>'
             h+='<div style="margin-bottom:8px"><label style=font-size:13px>元数据数量 </label><select id=metaCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=0 selected>全部</option><option value=10>10 本</option><option value=50>50 本</option><option value=100>100 本</option><option value=500>500 本</option><option value=1000>1000 本</option></select> <button class=btn id=metaBtn onclick="META()" style=background:#13c2c2>🌐 补全元数据</button></div>'
             h+='<div id=clsRes style=margin-top:4px;font-size:13px></div><div id=sumRes style=margin-top:4px;font-size:13px></div><div id=extRes style=margin-top:4px;font-size:13px></div><div id=metaRes style=margin-top:4px;font-size:13px></div></div>'
             #媒体库转录、摘要面板20260801
@@ -2580,20 +2619,26 @@ def fix_drive_paths():
         n3 = c.execute("UPDATE media SET file_path = ? || substr(file_path, 3) WHERE file_path LIKE ? || '%'", (cur_drive, old_drive)).rowcount
         c.commit()
         c.close()
-        print(f"✅ 路径修正完成: books.file_path {n1} 条, books.cover_path {n2} 条, media.file_path {n3} 条", flush=True)
+        print(f"[ok] drive-path fix: books.file_path {n1}, books.cover_path {n2}, media.file_path {n3}", flush=True)
     except Exception as e:
-        print(f"⚠️ 盘符修正出错: {e}", flush=True)
+        print(f"[warn] drive-path fix error: {e}", flush=True)
 
 if __name__ == "__main__":
-    import threading
+    import sys, threading
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     fix_drive_paths()
     migrate_schema()
     threading.Thread(target=migrate_text_content, daemon=True).start()
     HOST = os.environ.get("LIB_HOST", "127.0.0.1")
     PORT = int(os.environ.get("LIB_PORT", "8000"))
-    print(f"🚀 http://localhost:{PORT}")
-    print(f"📚 Private Lib | listening on {HOST}:{PORT}")
+    print(f"http://localhost:{PORT}")
+    print(f"Private Lib | listening on {HOST}:{PORT}")
+    print(f"Metadata online (LIB_METADATA_ONLINE): {'ENABLED' if ENABLE_ONLINE_METADATA else 'DISABLED (default off, set via start.bat/restart.bat)'}", flush=True)
     if HOST == "0.0.0.0":
-        print("⚠️  监听所有网卡（局域网可访问）。仅限 127.0.0.1 请设 LIB_HOST=127.0.0.1")
+        print("Listening on all interfaces (LAN accessible). For 127.0.0.1 only set LIB_HOST=127.0.0.1")
     print("[migrate] 12GB 文本搬迁已在后台启动，界面可立即使用；AI 文本功能待搬迁完成后生效", flush=True)
     http.server.ThreadingHTTPServer((HOST, PORT), H).serve_forever()
