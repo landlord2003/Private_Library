@@ -18,6 +18,7 @@ __pycache__/
 *.log
 _dup_log.txt
 _req_log.txt
+startup_log.txt
 
 # === 临时文件 ===
 *.tmp

@@ -5,6 +5,9 @@ from pathlib import Path
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
+# 在线元数据补全开关：默认关（离线优先、零依赖）。启用需设环境变量 LIB_METADATA_ONLINE=1 后重启。
+ENABLE_ONLINE_METADATA = os.environ.get("LIB_METADATA_ONLINE", "0") == "1"
+
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "library.db")
 _task_status = {}
 _count_cache = {"time": 0}
@@ -43,8 +46,8 @@ def get_counts():
             "tm": "SELECT count(*)as c FROM media WHERE status='active'",
             "ts": "SELECT count(*)as c FROM books WHERE status='active' AND summary IS NOT NULL",
             "import_rem": "SELECT count(*)as c FROM books WHERE status='active' AND id NOT IN(SELECT book_id FROM book_categories)",
-            "sum_rem": "SELECT count(*)as c FROM books WHERE status='active' AND summary IS NULL AND text_content IS NOT NULL",
-            "no_text": "SELECT count(*)as c FROM books WHERE status='active' AND text_content IS NULL",
+            "sum_rem": "SELECT count(*)as c FROM books WHERE status='active' AND summary IS NULL AND id IN (SELECT id FROM book_text WHERE text_content IS NOT NULL)",
+            "no_text": "SELECT count(*)as c FROM books WHERE status='active' AND id NOT IN (SELECT id FROM book_text WHERE text_content IS NOT NULL)",
             "fmt_dist": "SELECT file_format as k,count(*)as c FROM books WHERE status='active' GROUP BY file_format ORDER BY c DESC",
             "cat_dist": "SELECT cat.id as cid,cat.name as k,count(*)as c FROM categories cat JOIN book_categories bc ON cat.id=bc.category_id JOIN books b ON b.id=bc.book_id WHERE b.status='active' GROUP BY cat.id,cat.name ORDER BY c DESC LIMIT 20",
             "mtr": "SELECT count(*)as c FROM media WHERE status='active' AND transcript IS NOT NULL",
@@ -79,6 +82,17 @@ def dbe(sql, params=()):
     c.commit()
     c.close()
 
+def get_text(book_id):
+    """从副表 book_text 读取提取正文（保持 books 表窄行，使路径修正等 UPDATE 秒级完成）。"""
+    r = dbq("SELECT text_content FROM book_text WHERE id=?", (book_id,))
+    return (r[0]['text_content'] if r else '') or ''
+
+def set_text(book_id, text):
+    """写入/更新副表 book_text（UPSERT）。"""
+    dbe("INSERT INTO book_text(id, text_content) VALUES(?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET text_content=excluded.text_content",
+        (book_id, text))
+
 def migrate_schema():
     """P0：阅读进度(reading_status/last_page) + 智能书架(shelves)。幂等，可在启动时安全重复调用。"""
     c = sqlite3.connect(DB, timeout=30)
@@ -88,6 +102,8 @@ def migrate_schema():
         ("reading_status", "TEXT DEFAULT 'unread'"),
         ("last_page", "INTEGER DEFAULT 0"),
         ("last_read_at", "TEXT DEFAULT ''"),
+        ("metadata_source", "TEXT DEFAULT ''"),
+        ("metadata_conf", "REAL DEFAULT 0"),
     ]:
         if col not in cols:
             cur.execute("ALTER TABLE books ADD COLUMN %s %s" % (col, ddl))
@@ -96,7 +112,71 @@ def migrate_schema():
         q TEXT DEFAULT '', cat TEXT DEFAULT '', sub TEXT DEFAULT '',
         fmt TEXT DEFAULT '', diff TEXT DEFAULT '', rstat TEXT DEFAULT '',
         sort_order INTEGER DEFAULT 0)""")
+    for col, ddl in [("author","TEXT DEFAULT ''"),("tags","TEXT DEFAULT ''"),("year","TEXT DEFAULT ''")]:
+        _scols=[r[1] for r in cur.execute("PRAGMA table_info(shelves)").fetchall()]
+        if col not in _scols:
+            cur.execute("ALTER TABLE shelves ADD COLUMN %s %s" % (col, ddl))
+    # 20260825：把内联在 books 里的大字段 text_content 迁出到副表 book_text，
+    # 使 UPDATE books（如盘符路径修正）只改写窄行 -> 从“重写整张 12GB 表”变为“秒级”。
+    # 注意：12GB 文本搬迁改为【后台分块】执行（见 migrate_text_content()），避免阻塞服务启动。
+    cur.execute("""CREATE TABLE IF NOT EXISTS book_text (
+        id TEXT PRIMARY KEY,
+        text_content TEXT)""")
+    # P2-A 阅读笔记：确保列与当前代码一致。旧版可能已建过不同 schema（content/position/chapter/note_type），
+    # 用 IF NOT EXISTS 会跳过导致 note/page 列缺失 -> 所有笔记 SQL 报 no such column: note。
+    # 故检测：表不存在则新建；表存在但缺 note 列则重建（当前 0 行，无数据损失）。
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reading_notes'")
+    if cur.fetchone() is None:
+        cur.execute("""CREATE TABLE reading_notes (
+            id TEXT PRIMARY KEY, book_id TEXT NOT NULL, note TEXT DEFAULT '',
+            page INTEGER DEFAULT 0, created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '')""")
+    else:
+        cur.execute("SELECT COUNT(*) FROM pragma_table_info('reading_notes') WHERE name='note'")
+        if cur.fetchone()[0] == 0:
+            cur.execute("DROP TABLE IF EXISTS reading_notes")
+            cur.execute("""CREATE TABLE reading_notes (
+                id TEXT PRIMARY KEY, book_id TEXT NOT NULL, note TEXT DEFAULT '',
+                page INTEGER DEFAULT 0, created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '')""")
     c.commit(); c.close()
+
+def migrate_text_content():
+    """后台分块把 books.text_content 迁出到 book_text，避免 12GB 单事务阻塞启动。
+    分块提交：每批释放写锁，服务期间的笔记/进度写入不被长时间阻塞。幂等可断点续传。"""
+    try:
+        c = sqlite3.connect(DB, timeout=60)
+        cur = c.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS book_text (id TEXT PRIMARY KEY, text_content TEXT)")
+        cols = {r[1] for r in cur.execute("PRAGMA table_info(books)").fetchall()}
+        if 'text_content' not in cols:
+            c.close(); return
+        ids = [r[0] for r in cur.execute("SELECT id FROM books WHERE text_content IS NOT NULL").fetchall()]
+        total = len(ids)
+        batch = 200
+        done = 0
+        for i in range(0, total, batch):
+            chunk = ids[i:i+batch]
+            ph = ",".join("?" * len(chunk))
+            rows = cur.execute(f"SELECT id, text_content FROM books WHERE id IN ({ph})", chunk).fetchall()
+            cur.executemany("INSERT OR IGNORE INTO book_text(id, text_content) VALUES(?,?)",
+                            [(r[0], r[1]) for r in rows])
+            c.commit()
+            done += len(rows)
+            if done % 2000 == 0 or done == total:
+                print(f"[migrate] text_content 迁出进度 {done}/{total}", flush=True)
+        n_t = cur.execute("SELECT COUNT(*) FROM book_text").fetchone()[0]
+        n_b = cur.execute("SELECT COUNT(*) FROM books WHERE text_content IS NOT NULL").fetchone()[0]
+        if n_t == n_b:
+            try:
+                cur.execute("ALTER TABLE books DROP COLUMN text_content")
+                c.commit()
+                print(f"[migrate] text_content 已迁出至 book_text（{n_t} 本），books 表瘦身完成", flush=True)
+            except Exception as e:
+                print(f"[migrate] DROP COLUMN text_content 失败（保留原列）: {e}", flush=True)
+        else:
+            print(f"[migrate] text_content 复制未完成（{n_t}/{n_b}），暂缓 DROP 原列", flush=True)
+        c.close()
+    except Exception as e:
+        print(f"[migrate] text_content 迁出出错: {e}", flush=True)
 
 def he(s): return str(s).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
 def fc(f): return {'pdf':'#ff4d4f','epub':'#1677ff','rar':'#fa8c16','mobi':'#52c41a','azw3':'#13c2c2','txt':'#1677ff','md':'#722ed1'}.get(f,'#999')
@@ -104,7 +184,7 @@ def cc(c): return {'计算机与编程':'#1677ff','历史与人文':'#fa8c16','�
 
 CSS = """* { margin:0; padding:0; box-sizing:border-box; } body { font-family: "Microsoft YaHei", Arial, sans-serif; background: #f5f5f5; display: flex; min-height: 100vh; } nav { width: 250px; background: #fff; padding: 20px 0; box-shadow: 2px 0 8px rgba(0,0,0,0.05); } nav h2 { padding: 0 20px 20px; color: #1677ff; font-size: 18px; border-bottom: 1px solid #f0f0f0; margin-bottom: 10px; } nav a { display: block; padding: 12px 20px; color: #333; text-decoration: none; font-size: 15px; } nav a:hover { background: #e6f4ff; color: #1677ff; } main { flex: 1; padding: 24px; overflow-y: auto; } .sb { background: #fff; padding: 20px; border-radius: 8px; text-align: center; min-width: 140px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); text-decoration: none; color: inherit; } .sb .n { font-size: 28px; font-weight: bold; } .sb .l { font-size: 13px; color: #999; margin-top: 4px; } .row { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; } .tag { display: inline-block; padding: 3px 10px; border-radius: 4px; font-size: 12px; margin: 3px; color: #fff; } .panel { background: #fff; padding: 16px; border-radius: 8px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); } .panel h3 { margin-bottom: 12px; font-size: 16px; } .sch { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; } .sch input, .sch select { padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; } .sch input { flex: 1; min-width: 180px; } .sch button { padding: 8px 20px; background: #1677ff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; } .bk { background: #fff; border-radius: 8px; padding: 14px; margin-bottom: 8px; display: flex; gap: 12px; align-items: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05); cursor: pointer; } .bk:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.1); } .bk img { width: 50px; height: 70px; object-fit: cover; border-radius: 4px; flex-shrink: 0; } .bk .cv { width: 50px; height: 70px; border-radius: 4px; flex-shrink: 0; background: linear-gradient(135deg, #667eea, #764ba2); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 22px; } .bk .info { flex: 1; min-width: 0; } .bk .t { font-weight: bold; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .bk .m { font-size: 12px; color: #999; margin-top: 2px; } a { color: #1677ff; text-decoration: none; } a:hover { text-decoration: underline; } .co { color: #999; } .btn { padding: 8px 20px; background: #1677ff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; margin: 2px; } .bb2 { background: #fff; color: #1677ff; border: 1px solid #1677ff; } .detail { background: #fff; border-radius: 12px; padding: 24px; max-width: 800px; margin: 0 auto; box-shadow: 0 2px 12px rgba(0,0,0,0.1); overflow: hidden; } .detail h1 { margin-bottom: 16px; font-size: 22px; margin-right: 170px; } .detail .meta { margin-bottom: 16px; color: #666; font-size: 14px; line-height: 1.8; margin-right: 170px; } .detail .sec { margin: 16px 0; } .detail-cover { float: right; width: 150px; height: 200px; object-fit: contain; border-radius: 8px; background: #f5f5f5; margin-left: 16px; } .detail-cv { float: right; width: 150px; height: 200px; border-radius: 8px; background: linear-gradient(135deg, #667eea, #764ba2); display: flex; align-items: center; justify-content: center; color: #fff; font-size: 48px; margin-left: 16px; }"""
 
-NAV = '<nav><h2>📚 我的图书馆</h2><a href="/">🏠 首页</a><a href="/?p=books">📖 书库 ({B})</a><a href="/?p=media">🎧 媒体库 ({M})</a><a href="/?p=import">📥 导入新书</a><div class="cat-tree">{TREE}</div><div class="shelf-box">{SHELVES}</div></nav>'
+NAV = '<nav><h2>📚 我的图书馆</h2><a href="/">🏠 首页</a><a href="/?p=books">📖 书库 ({B})</a><a href="/?p=media">🎧 媒体库 ({M})</a><a href="/?p=import">📥 导入新书</a><a href="/?p=notes">📝 笔记 ({N})</a><div class="cat-tree">{TREE}</div><div class="shelf-box">{SHELVES}</div><div class="theme-row"><button class="theme-btn" onclick="toggleTheme()" title="切换深浅色">🌙 深色</button></div></nav>'
 
 EXTRA_CSS = """
 .cat-tree{padding:8px 0 14px;border-top:1px solid #f0f0f0;margin-top:6px;max-height:calc(100vh - 220px);overflow-y:auto}
@@ -169,6 +249,62 @@ EXTRA_CSS = """
   .card{width:calc(50% - 4px)}
   .card .t{font-size:10px}
 }
+/* ===== P2-B 主题变量 + 暗色覆盖层（不改动原浅色样式） ===== */
+:root{
+  --bg:#f5f5f5; --panel:#fff; --text:#222; --muted:#999; --primary:#1677ff;
+  --border:#f0f0f0; --border2:#ddd; --hover:#e6f4ff; --shadow:rgba(0,0,0,.05);
+  color-scheme:light;
+}
+[data-theme="dark"]{
+  --bg:#16181d; --panel:#21242b; --text:#e6e8eb; --muted:#8a9099; --primary:#4096ff;
+  --border:#2c3038; --border2:#353a44; --hover:#283447; --shadow:rgba(0,0,0,.5);
+  color-scheme:dark;
+}
+[data-theme="dark"] body{background:var(--bg);color:var(--text)}
+[data-theme="dark"] nav{background:var(--panel);box-shadow:2px 0 8px var(--shadow)}
+[data-theme="dark"] nav h2{color:var(--primary);border-color:var(--border)}
+[data-theme="dark"] nav a{color:var(--text)}
+[data-theme="dark"] nav a:hover{background:var(--hover);color:var(--primary)}
+[data-theme="dark"] main{background:var(--bg)}
+[data-theme="dark"] .panel,.sb{background:var(--panel);box-shadow:0 1px 3px var(--shadow)}
+[data-theme="dark"] .panel h3{color:var(--text)}
+[data-theme="dark"] .bk{background:var(--panel);box-shadow:0 1px 3px var(--shadow)}
+[data-theme="dark"] .bk .t,[data-theme="dark"] .card .t{color:var(--text)}
+[data-theme="dark"] .sch input,[data-theme="dark"] .sch select{background:var(--panel);color:var(--text);border-color:var(--border2)}
+[data-theme="dark"] .cat-tree .cl{color:var(--text)}
+[data-theme="dark"] .cat-tree .cl:hover,.cat-tree .cl.act{background:var(--hover);color:var(--primary)}
+[data-theme="dark"] .cat-tree .clink{color:var(--text)}
+[data-theme="dark"] .shelf-box .shelf{color:var(--text)}
+[data-theme="dark"] .shelf-box .shelf:hover{background:var(--hover);color:var(--primary)}
+[data-theme="dark"] .shelf-box .sb-h{color:var(--muted)}
+[data-theme="dark"] .shelf-box .empty{color:var(--muted)}
+[data-theme="dark"] .sb .l{color:var(--muted)}
+[data-theme="dark"] .rb.unread{background:#555}
+[data-theme="dark"] .tag{color:#fff}
+[data-theme="dark"] .topbar{background:#1f6feb}
+.theme-row{padding:14px 20px 18px;border-top:1px solid var(--border);margin-top:8px}
+.theme-btn{width:100%;padding:9px 12px;border:1px solid var(--primary);background:transparent;color:var(--primary);border-radius:6px;cursor:pointer;font-size:14px;text-align:left}
+.theme-btn:hover{background:var(--hover)}
+[data-theme="dark"] .theme-btn{color:var(--primary)}
+/* ===== P2-A 阅读笔记 ===== */
+.note-item{background:var(--panel);border:1px solid var(--border2);border-radius:8px;padding:10px 12px;margin-bottom:8px;box-shadow:0 1px 2px var(--shadow)}
+.note-body{white-space:pre-wrap;line-height:1.7;font-size:14px;color:var(--text)}
+.note-meta{margin-top:6px;font-size:12px;color:var(--muted)}
+.note-meta a{color:var(--muted);text-decoration:none;margin-left:4px}
+.note-meta a:hover{color:#ff4d4f}
+/* ===== 桌面自适应（两台不同宽度屏幕都好看） ===== */
+@media (min-width: 769px){
+  /* 侧栏宽度随屏宽流体缩放，而非死固定 250px */
+  nav{ width: clamp(210px, 16vw, 260px); }
+  /* 书卡网格：随可用宽度自动铺满、列数自适应，大小屏都均匀 */
+  .grid{ display:grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap:16px; }
+  .card{ width:auto; }
+  .card img, .card .cv{ width:100%; height:auto; aspect-ratio:116/162; }
+}
+/* 超宽屏：限制主内容最大宽度并居中，避免被拉得过散 */
+@media (min-width: 1700px){
+  main{ max-width:1500px; margin:0 auto; }
+}
 """
 
 def build_cat_tree(active_cat='', active_sub=''):
@@ -215,13 +351,13 @@ def build_cat_tree(active_cat='', active_sub=''):
     return ''.join(out)
 
 def build_shelves():
-    rows = dbq("SELECT id,name,q,cat,sub,fmt,diff,rstat FROM shelves ORDER BY sort_order,name")
+    rows = dbq("SELECT id,name,q,cat,sub,fmt,diff,rstat,author,tags,year FROM shelves ORDER BY sort_order,name")
     if not rows:
         return '<div class="sb-h">📑 我的书架 <a href="/?p=books" title="去书库页保存">＋</a></div><div class="empty">暂无书架，在书库页点「存为书架」</div>'
     out = ['<div class="sb-h">📑 我的书架 <a href="/?p=books" title="去书库页保存">＋</a></div>']
     for r in rows:
         qs = []
-        for k,v in (('q',r['q']),('cat',r['cat']),('sub',r['sub']),('fmt',r['fmt']),('diff',r['diff']),('rstat',r['rstat'])):
+        for k,v in (('q',r['q']),('cat',r['cat']),('sub',r['sub']),('fmt',r['fmt']),('diff',r['diff']),('rstat',r['rstat']),('author',r['author']),('tags',r['tags']),('year',r['year'])):
             if v: qs.append('%s=%s' % (k, he(str(v))))
         href = '/?p=books' + ('&'+'&'.join(qs) if qs else '')
         out.append('<div class="shelf"><a class="sn" href="%s" title="%s">%s</a><span class="sd" onclick="delShelf(\'%s\')" title="删除">✕</span></div>'
@@ -229,6 +365,51 @@ def build_shelves():
     return ''.join(out)
 
 COMMON_JS = """<script>
+(function(){try{var t=localStorage.getItem('theme');if(t)document.documentElement.dataset.theme=t;}catch(e){}})();
+function toggleTheme(){var d=document.documentElement;var n=d.dataset.theme==='dark'?'light':'dark';d.dataset.theme=n;try{localStorage.setItem('theme',n)}catch(e){}var b=document.querySelector('.theme-btn');if(b)b.textContent=(n==='dark'?'☀️ 浅色':'🌙 深色');}
+(function(){try{var t=document.documentElement.dataset.theme||'light';var b=document.querySelector('.theme-btn');if(b)b.textContent=(t==='dark'?'☀️ 浅色':'🌙 深色');}catch(e){}})();
+function loadNotes(bid){
+  var box=document.getElementById('notes-list'); if(!box)return;
+  fetch('/api/books/'+bid+'/notes').then(function(r){return r.json();}).then(function(rows){
+    box.innerHTML='';
+    if(!rows.length){var p=document.createElement('p');p.className='co';p.textContent='还没有笔记，写下第一条吧';box.appendChild(p);return;}
+    rows.forEach(function(n){
+      var d=document.createElement('div'); d.className='note-item';
+      var body=document.createElement('div'); body.className='note-body'; body.textContent=n.note;
+      var meta=document.createElement('div'); meta.className='note-meta';
+      meta.textContent=(n.page?('第 '+n.page+' 页 · '):'')+(n.created_at?n.created_at.slice(0,16):'')+' ';
+      var e=document.createElement('a'); e.href='#'; e.textContent='✏️'; e.title='编辑'; e.onclick=function(ev){ev.preventDefault();editNote(bid,n);};
+      var a=document.createElement('a'); a.href='#'; a.textContent='🗑️'; a.title='删除'; a.onclick=function(ev){ev.preventDefault();delNote(bid,n.id);};
+      meta.appendChild(e); meta.appendChild(a);
+      d.appendChild(body); d.appendChild(meta); box.appendChild(d);
+    });
+  }).catch(function(){var p=document.createElement('p');p.className='co';p.textContent='笔记加载失败';box.appendChild(p);});
+}
+var _editingNoteId=null;
+function editNote(bid,n){
+  var ta=document.getElementById('note-input'); var pg=document.getElementById('note-page');
+  if(!ta)return; ta.value=n.note; if(pg)pg.value=n.page||'';
+  _editingNoteId=n.id; ta.focus();
+  var btn=document.querySelector('#notes-sec button.btn'); if(btn)btn.textContent='💾 更新笔记';
+}
+function addNote(bid){
+  var ta=document.getElementById('note-input'); var pg=document.getElementById('note-page');
+  var note=(ta.value||'').trim(); if(!note){alert('笔记内容不能为空');return;}
+  var page=parseInt(pg.value)||0;
+  var action=_editingNoteId?'update':'add';
+  var payload={action:action,note:note,page:page};
+  if(_editingNoteId)payload.id=_editingNoteId;
+  var x=new XMLHttpRequest();x.open('POST','/api/books/'+bid+'/note');x.setRequestHeader('Content-Type','application/json');
+  x.onload=function(){var r=JSON.parse(x.responseText);if(r.ok){ta.value='';if(pg)pg.value='';_editingNoteId=null;var btn=document.querySelector('#notes-sec button.btn');if(btn)btn.textContent='＋ 保存笔记';loadNotes(bid);}else alert('保存失败');};
+  x.send(JSON.stringify(payload));
+}
+function delNote(bid,nid){
+  if(!confirm('删除这条笔记？'))return;
+  var x=new XMLHttpRequest();x.open('POST','/api/books/'+bid+'/note');x.setRequestHeader('Content-Type','application/json');
+  x.onload=function(){loadNotes(bid);};
+  x.send(JSON.stringify({action:'delete',id:nid}));
+}
+(function(){try{var nl=document.getElementById('notes-list');if(nl){var b=nl.getAttribute('data-bid');if(b)loadNotes(b);}}catch(e){}})();
 function EDT(id,old){var t=prompt("新书名:",old);if(t&&t!==old){var x=new XMLHttpRequest();x.open("POST","/api/books/"+id+"/edit");x.setRequestHeader("Content-Type","application/json");x.onload=function(){location.reload()};x.send(JSON.stringify({title:t}));}}
 function toggleCat(el){
   var ci=el.parentElement.parentElement;   // caret -> .cl -> .ci
@@ -289,6 +470,37 @@ function _pollSum(){
     }
   };
   x.onerror=function(){document.getElementById("sumRes").innerHTML="轮询出错，5秒后重试...";_sumTimer=setTimeout(_pollSum,5000);};
+  x.send()
+}
+var _metaTimer=null;
+function META(){
+  var b=document.getElementById("metaBtn");if(b.disabled)return;
+  var cnt=parseInt(document.getElementById("metaCnt").value)||0;
+  b.disabled=true;b.textContent="元数据启动中...";
+  document.getElementById("metaRes").innerHTML="启动中，需联网访问 Open Library / Google Books，请稍候...";
+  var x=new XMLHttpRequest();x.open("POST","/api/metadata-batch");x.setRequestHeader("Content-Type","application/json");
+  x.onload=function(){
+    var r=JSON.parse(x.responseText);
+    if(r.status==="disabled"){b.disabled=false;b.textContent="🌐 补全元数据";document.getElementById("metaRes").innerHTML="⚠️ 未启用：设置环境变量 LIB_METADATA_ONLINE=1 并重启服务";return;}
+    b.disabled=false;b.textContent="🌐 补全元数据";_pollMeta();
+  };
+  x.send(JSON.stringify({count:cnt}))
+}
+function _pollMeta(){
+  clearTimeout(_metaTimer);
+  var x=new XMLHttpRequest();x.open("GET","/api/task-status");
+  x.onload=function(){
+    var r=JSON.parse(x.responseText);var m=r.metadata||{};
+    if(m.total>0){
+      document.getElementById("metaRes").innerHTML="补全中: "+m.done+"/"+m.total+" 本（已填 "+m.filled+"，跳过 "+m.skipped+"）";
+      if(m.done<m.total)_metaTimer=setTimeout(_pollMeta,3000);
+      else document.getElementById("metaRes").innerHTML="✅ 补全完成: 共 "+m.total+" 本，填入 "+m.filled+" 本，跳过 "+m.skipped+" 本 <a href=/ onclick=location.reload()>刷新</a>";
+    }else{
+      document.getElementById("metaRes").innerHTML=m.total===0?"等待响应...":"";
+      _metaTimer=setTimeout(_pollMeta,3000);
+    }
+  };
+  x.onerror=function(){document.getElementById("metaRes").innerHTML="轮询出错，5秒后重试...";_metaTimer=setTimeout(_pollMeta,5000);};
   x.send()
 }
 var _extTimer=null;
@@ -418,11 +630,14 @@ function saveShelf(){
   var fmt=document.querySelector('input[name=fmt]').value;
   var diff=document.querySelector('select[name=diff]').value;
   var rstat=document.querySelector('select[name=rstat]').value;
-  var name=prompt("书架名称：", (cat?cat+' ':'')+(rstat?rstat+' ':'')+(diff?diff+' ':'').trim()||"我的书架");
+  var author=(document.querySelector('input[name=author]')||{}).value||'';
+  var tags=(document.querySelector('input[name=tags]')||{}).value||'';
+  var year=(document.querySelector('input[name=year]')||{}).value||'';
+  var name=prompt("书架名称：", (cat?cat+' ':'')+(author?author+' ':'')+(rstat?rstat+' ':'')+(diff?diff+' ':'').trim()||"我的书架");
   if(!name)return;
   var x=new XMLHttpRequest();x.open("POST","/api/shelves");x.setRequestHeader("Content-Type","application/json");
   x.onload=function(){var r=JSON.parse(x.responseText);if(r.ok){alert("已保存书架："+name);location.reload();}else alert("保存失败");};
-  x.send(JSON.stringify({name:name,q:q,cat:cat,sub:sub,fmt:fmt,diff:diff,rstat:rstat}));
+  x.send(JSON.stringify({name:name,q:q,cat:cat,sub:sub,fmt:fmt,diff:diff,rstat:rstat,author:author,tags:tags,year:year}));
 }
 // P0 删除书架
 function delShelf(id){
@@ -538,7 +753,7 @@ def extract_cover_for(book_id, file_path, fmt):
                 if doc.page_count > 0:
                     pix = doc[0].get_pixmap(dpi=72); cover_data = pix.tobytes("jpg")
                 doc.close()
-        elif fmt in ('rar','zip'):
+        elif fmt in ('rar','zip') and SEVEN_ZIP:
             import tempfile,subprocess
             r = subprocess.run([SEVEN_ZIP, 'l', '-slt', '-sccUTF-8', file_path], capture_output=True, text=True, timeout=30)
             entries = []; cur = {}
@@ -598,50 +813,155 @@ def _resolve_path(file_path):
                return alt
        return file_path
 
-# === 7z 压缩包支持 ===
-SEVEN_ZIP = r"C:\Program Files\7-Zip\7z.exe"
+# === 压缩包支持（7z 可选；zip 用标准库）===
+def find_7z():
+    """在常见路径与 PATH 中查找 7z 可执行文件，找不到返回 None。"""
+    import shutil
+    for c in [r"C:\Program Files\7-Zip\7z.exe", r"C:\Program Files (x86)\7-Zip\7z.exe", r"D:\7-Zip\7z.exe"]:
+        if os.path.exists(c):
+            return c
+    return shutil.which("7z") or shutil.which("7za") or None
+
+SEVEN_ZIP = find_7z()
 
 def list_archive_contents(archive_path):
-    """用 7z 列出压缩包内的文件列表"""
-    import subprocess
-    try:
-        result = subprocess.run([SEVEN_ZIP, 'l', '-slt', '-sccUTF-8', archive_path],
-                                capture_output=True, text=True, timeout=30, encoding='utf-8', errors='replace')
-        files = []
-        current = {}
-        for line in result.stdout.split('\n'):
-            line = line.strip()
-            if line.startswith('Path ='):
-                if current: files.append(current)
-                current = {'path': line[6:].strip()}
-            elif line.startswith('Size ='):
-                try: current['size'] = int(line[6:].strip())
-                except: current['size'] = 0
-        if current: files.append(current)
-        # 只返回实际文件（排除目录）
-        return [f for f in files if f.get('size', 0) > 0]
-    except Exception as e:
-        print(f"[7z list error] {e}", flush=True)
-        return []
+    """列出压缩包内文件。优先用 7z（支持 rar/7z/zip）；无 7z 时 zip 用标准库 zipfile。"""
+    import zipfile
+    if SEVEN_ZIP:
+        import subprocess
+        try:
+            result = subprocess.run([SEVEN_ZIP, 'l', '-slt', '-sccUTF-8', archive_path],
+                                    capture_output=True, text=True, timeout=30, encoding='utf-8', errors='replace')
+            files = []; current = {}
+            for line in result.stdout.split('\n'):
+                line = line.strip()
+                if line.startswith('Path ='):
+                    if current: files.append(current)
+                    current = {'path': line[6:].strip()}
+                elif line.startswith('Size ='):
+                    try: current['size'] = int(line[6:].strip())
+                    except: current['size'] = 0
+            if current: files.append(current)
+            return [f for f in files if f.get('size', 0) > 0]
+        except Exception as e:
+            print(f"[7z list error] {e}", flush=True)
+    if archive_path.lower().endswith('.zip'):
+        try:
+            with zipfile.ZipFile(archive_path) as zf:
+                return [{'path': i.filename, 'size': i.file_size} for i in zf.infolist() if not i.is_dir()]
+        except Exception as e:
+            print(f"[zip list error] {e}", flush=True)
+    return []
 
 def extract_archive_file(archive_path, file_name, dest_dir):
-    """从压缩包中提取单个文件到 dest_dir，返回提取后的文件路径"""
-    import subprocess
+    """从压缩包提取单个文件。7z 优先；无 7z 时 zip 用标准库 zipfile。"""
+    import zipfile
+    if SEVEN_ZIP:
+        import subprocess
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+        except (PermissionError, OSError) as e:
+            print(f"[archive cache] dest_dir inaccessible, falling back to system temp: {e}", flush=True)
+            dest_dir = os.path.join(tempfile.gettempdir(), "private_lib_archives", os.path.basename(dest_dir))
+            os.makedirs(dest_dir, exist_ok=True)
+        try:
+            subprocess.run([SEVEN_ZIP, 'e', archive_path, file_name, f'-o{dest_dir}', '-y'], capture_output=True, timeout=120)
+            extracted = os.path.join(dest_dir, os.path.basename(file_name))
+            return extracted if os.path.exists(extracted) else None
+        except Exception as e:
+            print(f"[7z extract error] {e}", flush=True)
+            return None
+    if archive_path.lower().endswith('.zip'):
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+            with zipfile.ZipFile(archive_path) as zf:
+                zf.extract(file_name, dest_dir)
+            extracted = os.path.join(dest_dir, file_name)
+            return extracted if os.path.exists(extracted) else None
+        except Exception as e:
+            print(f"[zip extract error] {e}", flush=True)
+    return None
+
+# === EPUB 服务端解包直读（标准库 zipfile，零第三方依赖）===
+import zipfile as _zf_mod, posixpath as _pp, re as _re_mod
+
+def _epub_opf_path(zf):
     try:
-        os.makedirs(dest_dir, exist_ok=True)
-    except (PermissionError, OSError) as e:
-        # 缓存目录 ACL 损坏（移动硬盘常见），回退到系统临时目录
-        print(f"[archive cache] dest_dir inaccessible, falling back to system temp: {e}", flush=True)
-        dest_dir = os.path.join(tempfile.gettempdir(), "private_lib_archives", os.path.basename(dest_dir))
-        os.makedirs(dest_dir, exist_ok=True)
+        cont = zf.read('META-INF/container.xml').decode('utf-8', 'ignore')
+    except Exception:
+        cont = ''
+    m = _re_mod.search(r'full-path="([^"]+)"', cont)
+    if m: return m.group(1)
+    for n in zf.namelist():
+        if n.lower().endswith('.opf'): return n
+    return None
+
+def get_epub_data(fp):
+    """返回 (title, [(zip_path, label), ...])；失败返回 (None, [])。"""
     try:
-        subprocess.run([SEVEN_ZIP, 'e', archive_path, file_name, f'-o{dest_dir}', '-y'],
-                       capture_output=True, timeout=120)
-        extracted = os.path.join(dest_dir, os.path.basename(file_name))
-        return extracted if os.path.exists(extracted) else None
-    except Exception as e:
-        print(f"[7z extract error] {e}", flush=True)
-        return None
+        zf = _zf_mod.ZipFile(fp)
+    except Exception:
+        return None, []
+    try:
+        opf = _epub_opf_path(zf)
+        if not opf: return None, []
+        opf_dir = _pp.dirname(opf)
+        opf_xml = zf.read(opf).decode('utf-8', 'ignore')
+        manifest = {}
+        for m in _re_mod.finditer(r'<item\b([^>]*)>', opf_xml, _re_mod.I):
+            attrs = m.group(1)
+            idm = _re_mod.search(r'\bid="([^"]+)"', attrs, _re_mod.I)
+            hm = _re_mod.search(r'\bhref="([^"]+)"', attrs, _re_mod.I)
+            if idm and hm:
+                manifest[idm.group(1)] = hm.group(1)
+        spine_ids = _re_mod.findall(r'<itemref\b[^>]*\bidref="([^"]+)"', opf_xml, _re_mod.I)
+        tm = _re_mod.search(r'<dc:title[^>]*>(.*?)</dc:title>', opf_xml, _re_mod.I | _re_mod.S)
+        title = tm.group(1).strip() if tm else ''
+        chapters = []
+        for sid in spine_ids:
+            href = manifest.get(sid)
+            if not href: continue
+            zp = _pp.normpath(_pp.join(opf_dir, href))
+            label = ''
+            try:
+                x = zf.read(zp).decode('utf-8', 'ignore')
+                h1 = _re_mod.search(r'<h1[^>]*>(.*?)</h1>', x, _re_mod.I | _re_mod.S)
+                if h1: label = _re_mod.sub(r'<[^>]+>', '', h1.group(1)).strip()
+                else:
+                    tt = _re_mod.search(r'<title[^>]*>(.*?)</title>', x, _re_mod.I | _re_mod.S)
+                    if tt: label = _re_mod.sub(r'<[^>]+>', '', tt.group(1)).strip()
+            except Exception:
+                pass
+            chapters.append((zp, label))
+        if not chapters:
+            for n in zf.namelist():
+                if n.lower().endswith(('.xhtml', '.html', '.htm')):
+                    chapters.append((n, _pp.basename(n)))
+        return title, chapters
+    finally:
+        zf.close()
+
+def _epub_chapter_html(fp, zip_path, bid):
+    zf = _zf_mod.ZipFile(fp)
+    try:
+        data = zf.read(zip_path)
+    finally:
+        zf.close()
+    m = _re_mod.search(r'encoding="([^"]+)"', data[:200].decode('ascii', 'ignore'), _re_mod.I)
+    enc = m.group(1) if m else 'utf-8'
+    try:
+        html = data.decode(enc)
+    except Exception:
+        html = data.decode('utf-8', 'ignore')
+    chapter_dir = _pp.dirname(zip_path)
+    base = '/api/books/' + bid + '/epub/asset/'
+    def rw(mo):
+        attr = mo.group(1); val = mo.group(2)
+        if val.startswith(('#', 'http:', 'https:', 'mailto:', 'data:', 'ftp:')):
+            return mo.group(0)
+        resolved = _pp.normpath(_pp.join(chapter_dir, val))
+        return attr + '="' + base + urllib.parse.quote(resolved) + '"'
+    return _re_mod.sub(r'(src|href)="([^"]+)"', rw, html, flags=_re_mod.I)
 
 def _title_fallback(book_id):
     """Use book metadata as minimal text for books that can't be extracted."""
@@ -652,7 +972,7 @@ def _title_fallback(book_id):
         if r[0]['description']: parts.append(r[0]['description'])
         text = '\n'.join(parts)
         if text.strip():
-            dbe("UPDATE books SET text_content=? WHERE id=?", (text[:200000], book_id))
+            set_text(book_id, text[:200000])
             return True
     return False
 
@@ -759,7 +1079,7 @@ def extract_text_for(book_id, file_path, fmt):
                 shutil.rmtree(tmp, ignore_errors=True)
         if text and len(text.strip()) > 10:
             text = text[:200000]
-            dbe("UPDATE books SET text_content=? WHERE id=?", (text, book_id))
+            set_text(book_id, text)
             return True
         # Fallback: use title if extraction yielded nothing
         return _title_fallback(book_id)
@@ -773,7 +1093,7 @@ def run_extract_async(count=10):
     _task_status['er_r'] = {"done":0,"total":0}
     def w():
         try:
-            books = dbq("SELECT id,file_path,file_format,title FROM books WHERE status='active' AND text_content IS NULL LIMIT ?",(int(count),))
+            books = dbq("SELECT id,file_path,file_format,title FROM books WHERE status='active' AND id NOT IN (SELECT id FROM book_text WHERE text_content IS NOT NULL) LIMIT ?",(int(count),))
             rv = {"done":0,"total":len(books)}
             for b in books:
                 try:
@@ -814,7 +1134,7 @@ def run_classify_async(count=10):
     def w():
         try:
             # 取“无分类”或“有分类但缺二级”的书
-            books = dbq("SELECT id,title,text_content FROM books WHERE status='active' AND id NOT IN (SELECT book_id FROM book_categories WHERE subcategory_id IS NOT NULL) LIMIT ?",(int(count),))
+            books = dbq("SELECT b.id,b.title,t.text_content FROM books b LEFT JOIN book_text t ON t.id=b.id WHERE b.status='active' AND b.id NOT IN (SELECT book_id FROM book_categories WHERE subcategory_id IS NOT NULL) LIMIT ?",(int(count),))
             tax = _get_taxonomy()
             cats = list(tax.keys()) if tax else ["计算机与编程","历史与人文","文学与小说","哲学与思想","科学与科普","经济与管理","心理与成长","教育学习","艺术设计","社会与政治","生活与健康","其他"]
             clist_lines = []
@@ -864,7 +1184,7 @@ def run_summarize_async(count=3):
     _task_status['sr_r'] = {"done":0,"total":0}
     def w():
         try:
-            books=dbq("SELECT id,title,text_content FROM books WHERE status='active' AND summary IS NULL AND text_content IS NOT NULL LIMIT ?",(int(count),))
+            books=dbq("SELECT b.id,b.title,t.text_content FROM books b JOIN book_text t ON t.id=b.id WHERE b.status='active' AND b.summary IS NULL LIMIT ?",(int(count),))
             rv={"done":0,"total":len(books)}
             for b in books:
                 try:
@@ -882,6 +1202,168 @@ def run_summarize_async(count=3):
             _task_status['sr']=False
             _count_cache["time"] = 0
     threading.Thread(target=w,daemon=True).start()
+    return {"status":"started"}
+
+# ==================== 在线元数据补全（功能化整合，零依赖 urllib） ====================
+def _clean_title(t):
+    """清洗书名噪声用于相似度比对，避免‘全集/套装/插图版’等干扰匹配。"""
+    import re
+    t = (t or "").strip()
+    t = re.sub(r"[（(][^（）()]*[)）]", " ", t)
+    t = re.sub(r"[【\[][^】\]]*[\]\]]", " ", t)
+    for w in ("套装","全集","合集","选集","作品集","典藏","精装","珍藏","插图版","图文版","彩图版",
+              "修订版","增订版","校订版","注释版","译注版","典藏版","完整版","未删减","全本",
+              "上下册","上中下册","新版","原版","正版","畅销","文库","丛书","系列"):
+        t = t.replace(w, " ")
+    return t.strip()
+
+def _sim(a, b):
+    import difflib
+    return difflib.SequenceMatcher(None, _clean_title(a), _clean_title(b)).ratio()
+
+def _http_get_json(url, timeout=5):
+    """标准库 urllib 发 GET，自动读取 HTTP_PROXY/HTTPS_PROXY 环境变量（复用 git 代理）。失败返回 None。"""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (PrivateLib)"})
+        proxy = urllib.request.ProxyHandler(urllib.request.getproxies())
+        opener = urllib.request.build_opener(proxy)
+        with opener.open(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "ignore"))
+    except Exception as e:
+        print(f"[元数据HTTP失败] {url[:80]}: {type(e).__name__}: {e}", flush=True)
+        return None
+
+def fetch_online_metadata(title, author=None, isbn=None):
+    """在线补全单本书元数据（Open Library 优先 + Google Books 兜底，均无需 key）。
+    返回 dict: {publisher,publish_date,isbn,language,description,source,sim} 或 None。
+    仅用于填空字段；sim 为书名相似度，ISBN 命中时置 1.0。"""
+    if not ENABLE_ONLINE_METADATA:
+        return None
+    title = (title or "").strip()
+    if not title and not isbn:
+        return None
+    result = None
+    best_sim = 0.0
+    # 1) Open Library
+    try:
+        ol = None
+        if isbn:
+            ol = _http_get_json("https://openlibrary.org/isbn/%s.json?jscmd=details&format=json" % isbn.replace("-",""), timeout=5)
+            best_sim = 1.0
+        if not ol and title:
+            s = _http_get_json("https://openlibrary.org/search.json?title=" + urllib.parse.quote(title)
+                               + ("&author=" + urllib.parse.quote(author) if author else "") + "&limit=5", timeout=5)
+            docs = (s or {}).get("docs", [])
+            if docs:
+                best = None; bs = 0.0
+                for d in docs:
+                    sm = _sim(title, d.get("title",""))
+                    if sm > bs: bs = sm; best = d
+                best_sim = bs
+                if best:
+                    ol = best
+                    if str(best.get("key","")).startswith("/works/"):
+                        wk = _http_get_json("https://openlibrary.org" + best["key"] + ".json", timeout=5)
+                        if wk and isinstance(wk.get("description"), str):
+                            ol = dict(ol); ol["_desc"] = wk["description"]
+                        elif wk and isinstance(wk.get("description"), dict):
+                            ol = dict(ol); ol["_desc"] = wk["description"].get("value","")
+        if ol:
+            pub = ol.get("publishers")
+            pub = pub[0] if isinstance(pub, list) and pub else ""
+            pd = ol.get("first_publish_year") or (ol.get("publish_date") if isinstance(ol.get("publish_date"), str) else "")
+            il = ol.get("isbn") if isinstance(ol.get("isbn"), list) else []
+            isbn2 = il[0] if il else ""
+            ll = ol.get("language") if isinstance(ol.get("language"), list) else []
+            lang = ll[0] if ll else ""
+            desc = ol.get("_desc") or (ol.get("description") if isinstance(ol.get("description"), str) else "")
+            if isinstance(desc, dict): desc = desc.get("value","")
+            result = {"publisher": pub or "", "publish_date": str(pd) if pd else "",
+                      "isbn": isbn2 or "", "language": lang or "",
+                      "description": (desc or "")[:2000], "source": "openlibrary", "sim": best_sim}
+    except Exception as e:
+        print(f"[OL失败] {title[:30]}: {e}", flush=True)
+    # 2) Google Books 兜底（补 description / 未匹配时）
+    try:
+        if (not result) or (not result.get("description")) or (title and best_sim < 0.8):
+            gq = title + (" " + author if author else "")
+            g = _http_get_json("https://www.googleapis.com/books/v1/volumes?q=" + urllib.parse.quote(gq) + "&maxResults=5", timeout=5)
+            items = (g or {}).get("items", [])
+            if items:
+                vi = items[0].get("volumeInfo", {})
+                gdesc = vi.get("description","")
+                gsim = _sim(title, vi.get("title",""))
+                if (not result) or (gdesc and not result.get("description")) or (gsim > result.get("sim",0)):
+                    merged = dict(result) if result else {}
+                    gis = ""; ids = vi.get("industryIdentifiers", [])
+                    for i in ids:
+                        if i.get("type") in ("ISBN_13","ISBN_10"): gis = i.get("identifier",""); break
+                    merged.update({
+                        "publisher": vi.get("publisher","") or merged.get("publisher",""),
+                        "publish_date": vi.get("publishedDate","") or merged.get("publish_date",""),
+                        "isbn": gis or merged.get("isbn",""),
+                        "language": vi.get("language","") or merged.get("language",""),
+                        "description": gdesc or merged.get("description",""),
+                        "source": "googlebooks",
+                        "sim": max(gsim, merged.get("sim",0)),
+                    })
+                    merged["description"] = (merged["description"] or "")[:2000]
+                    result = merged
+    except Exception as e:
+        print(f"[GB失败] {title[:30]}: {e}", flush=True)
+    return result
+
+def run_metadata_async(count=None):
+    """异步批量补全在线元数据。count=None 表示全库扫描（默认回填存量）。
+    仅填空字段、按相似度阈值防错配、限速、受 ENABLE_ONLINE_METADATA 开关控制。"""
+    if _task_status.get('mr'): return {"status":"running"}
+    if not ENABLE_ONLINE_METADATA:
+        return {"status":"disabled", "msg":"在线元数据未启用（设置环境变量 LIB_METADATA_ONLINE=1 后重启服务）"}
+    _task_status['mr'] = True
+    _task_status['mr_r'] = {"done":0,"total":0,"filled":0,"skipped":0}
+    def w():
+        try:
+            sql = ("SELECT id,title,author,publisher,isbn,language,description FROM books "
+                   "WHERE status='active' AND (publisher IS NULL OR publisher='') "
+                   "AND (isbn IS NULL OR isbn='') AND (description IS NULL OR description='')")
+            if count:
+                sql += " LIMIT %d" % int(count)
+            books = dbq(sql)
+            rv = {"done":0,"total":len(books),"filled":0,"skipped":0}
+            for b in books:
+                try:
+                    meta = fetch_online_metadata(b['title'], b.get('author'), b.get('isbn'))
+                    if meta:
+                        sim = meta.get("sim", 0)
+                        isbn_match = bool(b.get('isbn')) and meta.get("isbn") and b['isbn'].replace("-","")==meta["isbn"].replace("-","")
+                        trusted = isbn_match or sim >= 0.8 or (sim >= 0.6 and meta.get("description"))
+                        if trusted:
+                            sets = []; params = []
+                            for col in ("publisher","publish_date","isbn","language","description"):
+                                v = (meta.get(col) or "").strip()
+                                if v:
+                                    sets.append(col + "=?"); params.append(v[:2000] if col=="description" else v)
+                            if sets:
+                                sets.append("metadata_source=?"); params.append(meta.get("source",""))
+                                sets.append("metadata_conf=?"); params.append(round(sim,2))
+                                params.append(b['id'])
+                                dbe("UPDATE books SET " + ", ".join(sets) + " WHERE id=?", params)
+                                rv["filled"] += 1
+                        else:
+                            rv["skipped"] += 1
+                            print(f"[元数据低置信跳过] {b['title'][:30]}: sim={sim:.2f}", flush=True)
+                    else:
+                        rv["skipped"] += 1
+                    rv["done"] += 1; _task_status['mr_r'] = rv
+                    time.sleep(1.2)
+                except Exception as e:
+                    print(f"[元数据异常] {b['title'][:30]}: {type(e).__name__}: {e}", flush=True)
+                    rv["done"] += 1; _task_status['mr_r'] = rv
+            _task_status['mr_r'] = rv
+        finally:
+            _task_status['mr'] = False
+            _count_cache["time"] = 0
+    threading.Thread(target=w, daemon=True).start()
     return {"status":"started"}
 #20260801添加媒体提取摘要
 # ==================== 媒体转录/摘要 ====================
@@ -1147,6 +1629,10 @@ def run_scan_import_async(directory, itype='all'):
                     print(f"[scan import error] {fn}: {e}", flush=True)
             rv["current"] = ""; rv["message"] = f"完成! 新增 {rv['done']-rv['duplicates']-rv['errors']} 个, 重复 {rv['duplicates']} 个" + (f", 失败 {rv['errors']} 个" if rv['errors'] else "")
             _task_status['ir_r'] = rv
+            # 导入完成后自动补全在线元数据（仅开关开启且当前无任务时）
+            if ENABLE_ONLINE_METADATA and not _task_status.get('mr'):
+                try: run_metadata_async(None)
+                except Exception as e: print(f"[导入后自动元数据失败] {e}", flush=True)
             _count_cache["time"] = 0
         except Exception as e:
             _task_status['ir_r'] = {"done":0,"total":0,"duplicates":0,"errors":1,"current":"","message":f"扫描失败: {str(e)[:200]}"}
@@ -1180,6 +1666,7 @@ class H(http.server.SimpleHTTPRequestHandler):
                 else: self.json({"error":"title empty"}); return
             if path == "/api/classify-batch": self.json(run_classify_async(data.get('count',10))); return
             if path == "/api/summarize-batch": self.json(run_summarize_async(data.get('count',3))); return
+            if path == "/api/metadata-batch": self.json(run_metadata_async(data.get('count') or None)); return
             if path == "/api/extract-batch": self.json(run_extract_async(data.get('count',10))); return
             # 媒体转录/摘要 20260801
             if path == "/api/media/transcribe": self.json(run_transcribe_async(data.get('count',10), data.get('media_type','all'))); return
@@ -1203,6 +1690,22 @@ class H(http.server.SimpleHTTPRequestHandler):
                 shutil.rmtree(os.path.join("data","books",bid), ignore_errors=True)
                 _count_cache["time"]=0
                 self.json({"ok":True}); return
+            # P2-A 阅读笔记 CRUD
+            if path.startswith("/api/books/") and path.endswith("/note"):
+                bid=path.split("/")[3]; act=data.get('action','add')
+                if act=='add':
+                    note=(data.get('note','') or '').strip()
+                    if not note: self.json({"error":"note empty"}); return
+                    nid=str(uuid.uuid4()); pg=int(data.get('page',0) or 0)
+                    dbe("INSERT INTO reading_notes(id,book_id,note,page,created_at,updated_at) VALUES(?,?,?,?,datetime('now'),datetime('now'))",(nid,bid,note,pg))
+                    self.json({"ok":True,"id":nid}); return
+                if act=='delete':
+                    dbe("DELETE FROM reading_notes WHERE id=? AND book_id=?",(data.get('id',''),bid))
+                    self.json({"ok":True}); return
+                if act=='update':
+                    dbe("UPDATE reading_notes SET note=?,page=?,updated_at=datetime('now') WHERE id=? AND book_id=?",((data.get('note','') or '').strip(),int(data.get('page',0) or 0),data.get('id',''),bid))
+                    self.json({"ok":True}); return
+                self.json({"error":"unknown action"}); return
             # 删除媒体 20260816
             if path.startswith("/api/media/") and path.endswith("/delete"):
                 mid=path.split("/")[3]
@@ -1227,9 +1730,10 @@ class H(http.server.SimpleHTTPRequestHandler):
                 name=(data.get('name','') or '').strip()
                 if not name: self.json({"error":"name empty"}); return
                 sid=str(uuid.uuid4())
-                dbe("INSERT INTO shelves(id,name,q,cat,sub,fmt,diff,rstat) VALUES(?,?,?,?,?,?,?,?)",
+                dbe("INSERT INTO shelves(id,name,q,cat,sub,fmt,diff,rstat,author,tags,year) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (sid, name, data.get('q','') or '', data.get('cat','') or '', data.get('sub','') or '',
-                     data.get('fmt','') or '', data.get('diff','') or '', data.get('rstat','') or ''))
+                     data.get('fmt','') or '', data.get('diff','') or '', data.get('rstat','') or '',
+                     data.get('author','') or '', data.get('tags','') or '', data.get('year','') or ''))
                 self.json({"ok":True,"id":sid}); return
             if path == "/api/shelves/delete":
                 dbe("DELETE FROM shelves WHERE id=?",(data.get('id',''),))
@@ -1301,7 +1805,11 @@ class H(http.server.SimpleHTTPRequestHandler):
         p=urllib.parse.urlparse(self.path); path=p.path; qs=urllib.parse.parse_qs(p.query)
         try:
             if path=="/api/health": self.json({"status":"ok"})
-            elif path=="/api/task-status": self.json({"classify":_task_status.get('cr_r',{}),"summarize":_task_status.get('sr_r',{}),"extract":_task_status.get('er_r',{}),"transcribe":_task_status.get('tr_r',{}),"media_summarize":_task_status.get('ms_r',{}),"scan_import":_task_status.get('ir_r',{})})
+            elif path=="/api/task-status": self.json({"classify":_task_status.get('cr_r',{}),"summarize":_task_status.get('sr_r',{}),"extract":_task_status.get('er_r',{}),"transcribe":_task_status.get('tr_r',{}),"media_summarize":_task_status.get('ms_r',{}),"scan_import":_task_status.get('ir_r',{}),"metadata":_task_status.get('mr',{})})
+            elif path.startswith("/api/books/") and path.endswith("/notes"):
+                bid=path.split("/")[3]
+                rows=dbq("SELECT id,note,page,created_at FROM reading_notes WHERE book_id=? ORDER BY created_at DESC",(bid,))
+                self.json([dict(r) for r in rows]); return
 
             elif path.startswith("/api/books/") and path.endswith("/read"):
                 bid=path.split("/")[3]
@@ -1310,26 +1818,80 @@ class H(http.server.SimpleHTTPRequestHandler):
                 fp,fmt,title=_resolve_path(r[0]['file_path']),r[0]['file_format'],r[0]['title']
                 if not os.path.exists(fp): self.send_error(404); return
                 if fmt=='epub':
-                    try:
-                        from ebooklib import epub; from bs4 import BeautifulSoup
-                        bk=epub.read_epub(fp); st,bp=[],[]
-                        for it in bk.get_items():
-                            if it.get_type()==5:
-                                try: st.append(it.get_content().decode('utf-8','ignore'))
-                                except: pass
-                            elif it.get_type()==9:
-                                try:
-                                    sp=BeautifulSoup(it.get_content(),'html.parser')
-                                    b=sp.find('body'); bp.append(str(b)if b else str(sp))
-                                except: pass
-                        h='<!DOCTYPE html><html><head><meta charset=utf-8><title>'+title+'</title>'
-                        for s in st[:3]: h+='<style>'+s+'</style>'
-                        h+='<style>body{max-width:800px;margin:0 auto;padding:20px;font-family:serif;font-size:18px;line-height:1.8}img{max-width:100%}</style></head><body><h1>'+title+'</h1>'+'\n'.join(bp)+'</body></html>'
-                        self._html(h)
-                    except: self.send_error(500)
+                    _pr = dbq("SELECT last_page FROM books WHERE id=?",(bid,))
+                    _start = int(_pr[0]['last_page']) if (_pr and _pr[0]['last_page']) else 0
+                    viewer = '''<!DOCTYPE html><html><head><meta charset=utf-8>
+<meta name="color-scheme" content="light only">
+<title>__TITLE__</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#fff;color:#222;font-family:system-ui,'Segoe UI',sans-serif}
+#toolbar{position:fixed;top:0;left:0;right:0;height:48px;display:flex;align-items:center;gap:8px;padding:0 12px;background:#20232a;color:#fff;z-index:10}
+#toolbar button,#toolbar select{background:#3a3f4b;color:#fff;border:none;border-radius:6px;padding:6px 10px;cursor:pointer;font-size:13px}
+#toolbar button:hover,#toolbar select:hover{background:#4a5160}
+#content{position:fixed;top:48px;left:0;right:0;bottom:0;overflow:auto;padding:24px;max-width:900px;margin:0 auto;line-height:1.9;font-size:18px}
+#content img{max-width:100%}
+.spacer{flex:1}
+.prog{font-size:12px;color:#bbb}
+</style></head><body>
+<div id="toolbar">
+<button onclick="prev()">◀ 上一章</button>
+<button onclick="next()">下一章 ▶</button>
+<select id="toc" onchange="show(this.value)"><option value="">☰ 目录</option></select>
+<button onclick="decFont()">A−</button>
+<button onclick="incFont()">A+</button>
+<span class="spacer"></span>
+<span class="prog" id="prog">…</span>
+</div>
+<div id="content"><p style="color:#888">加载中…</p></div>
+<script>
+var BOOK_ID="__BID__", START=__START__, chapters=[], assetMap={}, cur=0, fontSize=100;
+function loadInfo(){
+  fetch('/api/books/'+BOOK_ID+'/epub/info').then(function(r){return r.json();}).then(function(d){
+    chapters=d.chapters;
+    var sel=document.getElementById('toc');
+    chapters.forEach(function(c){var o=document.createElement('option');o.value=c.i;o.textContent=(c.i+1)+'. '+(c.label||('第 '+(c.i+1)+' 节'));sel.appendChild(o);assetMap[encodeURIComponent(c.path)]=c.i;});
+    cur=Math.max(0,Math.min(START,chapters.length-1));
+    show(cur);
+  }).catch(function(){document.getElementById('content').innerHTML='<p style="color:#c00">无法读取本书，请确认文件完好。</p>';});
+}
+function show(i){cur=parseInt(i);var box=document.getElementById('content');box.innerHTML='<p style="color:#888">加载中…</p>';
+  fetch('/api/books/'+BOOK_ID+'/epub/chapter/'+cur).then(function(r){return r.text();}).then(function(h){
+    box.innerHTML=h;applyFont();
+    document.getElementById('toc').value=cur;
+    document.getElementById('prog').textContent=(cur+1)+' / '+chapters.length;
+    saveProgress(cur);
+    box.scrollTop=0;
+  });
+}
+function prev(){if(cur>0)show(cur-1);}
+function next(){if(cur<chapters.length-1)show(cur+1);}
+function applyFont(){document.getElementById('content').style.fontSize=fontSize+'%';}
+function incFont(){fontSize=Math.min(fontSize+10,200);applyFont();}
+function decFont(){fontSize=Math.max(fontSize-10,60);applyFont();}
+function saveProgress(i){var x=new XMLHttpRequest();x.open('POST','/api/progress');x.setRequestHeader('Content-Type','application/json');x.send(JSON.stringify({id:BOOK_ID,status:'reading',page:i}));}
+document.getElementById('content').addEventListener('click',function(e){var a=e.target.closest('a');if(!a)return;var h=a.getAttribute('href')||'';var k=h.indexOf('/epub/asset/');if(k>=0){e.preventDefault();var p=decodeURIComponent(h.substring(k+12));if(assetMap[p]!=null)show(assetMap[p]);}});
+loadInfo();
+</script>
+</body></html>'''
+                    viewer = viewer.replace('__BID__', bid).replace('__START__', str(_start)).replace('__TITLE__', he(title))
+                    self.send_response(200)
+                    self.send_header("Content-Type","text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(viewer.encode('utf-8'))
+                    return
                 elif fmt in ('rar','zip','7z'):
                     try:
                         files = list_archive_contents(fp)
+                        if not files:
+                            if fmt=='zip' and not SEVEN_ZIP:
+                                note='⚠️ 该 ZIP 压缩包读取失败，请重试。'
+                            elif not SEVEN_ZIP:
+                                note='⚠️ 本机未安装 7-Zip，无法读取 RAR / 7z 压缩包。请到 https://7-zip.org 下载安装 7-Zip（默认路径 C:\\Program Files\\7-Zip\\7z.exe），重启服务后即可阅读。ZIP 压缩包无需 7-Zip。'
+                            else:
+                                note='压缩包内未识别到可读文件。'
+                            h='<!DOCTYPE html><html><head><meta charset=utf-8><title>'+he(title)+'</title><style>body{max-width:760px;margin:0 auto;padding:40px 20px;font-family:sans-serif;color:#333;line-height:1.8}</style></head><body><h1>📦 '+he(title)+'</h1><div style="background:#fff3cd;padding:16px;border-radius:8px;color:#8a6d00">'+he(note)+'</div><p style="margin-top:16px"><a href="javascript:history.back()">← 返回</a></p></body></html>'
+                            self._html(h); return
                         h='<!DOCTYPE html><html><head><meta charset=utf-8><title>'+he(title)+'</title>'
                         h+='<style>body{max-width:900px;margin:0 auto;padding:20px;font-family:sans-serif;background:#fff;color:#333}'
                         h+='.fl{display:flex;align-items:center;padding:10px 16px;margin:4px 0;background:#f5f5f5;border-radius:8px;text-decoration:none;color:#333;transition:background .2s}'
@@ -1340,7 +1902,6 @@ class H(http.server.SimpleHTTPRequestHandler):
                         h+='.stats{padding:12px 16px;background:#e8f5e9;border-radius:8px;margin-bottom:16px;font-size:14px;color:#2e7d32}'
                         h+='</style></head><body><h1>📦 '+he(title)+'</h1>'
                         h+='<div class=stats>压缩包内共 '+str(len(files))+' 个文件</div>'
-                        # 按文件名排序
                         files.sort(key=lambda x: x.get('path',''))
                         img_exts = {'.jpg','.jpeg','.png','.gif','.bmp','.webp'}
                         doc_exts = {'.pdf','.epub','.txt','.md'}
@@ -1351,7 +1912,7 @@ class H(http.server.SimpleHTTPRequestHandler):
                             if ext in doc_exts: ic='📄'
                             elif ext in img_exts: ic='🖼️'
                             else: ic='📦'
-                            sz_str = str(round(sz/1024/1024,1))+'MB' if sz>1048576 else str(round(sz/1024))+'KB'
+                            sz_str = str(round(sz/1048576,1))+'MB' if sz>1048576 else str(round(sz/1024))+'KB'
                             url = '/api/books/'+bid+'/archive/'+urllib.parse.quote(fn)
                             h+='<a class=fl href="'+url+'" target=_blank><span class=ic>'+ic+'</span><span class=nm>'+he(fn)+'</span><span class=sz>'+sz_str+'</span></a>'
                         h+='</body></html>'
@@ -1359,8 +1920,9 @@ class H(http.server.SimpleHTTPRequestHandler):
                     except Exception as e:
                         print(f"[RAR reader error] {e}", flush=True)
                         self.send_error(500, str(e))
+
                 else:
-                    r2=dbq("SELECT text_content FROM books WHERE id=?",(bid,))
+                    r2=dbq("SELECT text_content FROM book_text WHERE id=?",(bid,))
                     t=(r2[0]['text_content'] if r2 else '') or ''
                     t=t.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
                     h='<!DOCTYPE html><html><head><meta charset=utf-8><title>'+title+'</title><style>body{max-width:800px;margin:0 auto;padding:20px;font-family:serif;font-size:18px;line-height:2;white-space:pre-wrap}</style></head><body><h1>'+title+'</h1><div>'+t+'</div></body></html>'
@@ -1392,6 +1954,40 @@ class H(http.server.SimpleHTTPRequestHandler):
                     self.send_header("Content-Disposition","inline"); self.end_headers()
                     with open(fp,'rb')as f: self.wfile.write(f.read())
                 else: self.send_error(404)
+            elif path.startswith("/api/books/") and path.endswith("/epub/info"):
+                bid=path.split("/")[3]
+                r=dbq("SELECT file_path,title FROM books WHERE id=?",(bid,))
+                if not r: self.send_error(404); return
+                fp=_resolve_path(r[0]['file_path'])
+                title,chapters=get_epub_data(fp)
+                import json
+                self.send_response(200); self.send_header("Content-Type","application/json; charset=utf-8"); self.end_headers()
+                self.wfile.write(json.dumps({"title":(title or r[0]['title']),"chapters":[{"i":i,"label":(c[1] or ("第 %d 节"%(i+1))),"path":c[0]} for i,c in enumerate(chapters)],"total":len(chapters)},ensure_ascii=False).encode('utf-8'))
+            elif path.startswith("/api/books/") and "/epub/chapter/" in path:
+                bid=path.split("/")[3]
+                try: idx=int(path.split("/epub/chapter/",1)[1])
+                except Exception: idx=-1
+                r=dbq("SELECT file_path FROM books WHERE id=?",(bid,))
+                if not r: self.send_error(404); return
+                fp=_resolve_path(r[0]['file_path'])
+                _,chapters=get_epub_data(fp)
+                if idx<0 or idx>=len(chapters): self.send_error(404); return
+                html=_epub_chapter_html(fp,chapters[idx][0],bid)
+                self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.end_headers(); self.wfile.write(html.encode('utf-8'))
+            elif path.startswith("/api/books/") and "/epub/asset/" in path:
+                bid=path.split("/")[3]
+                r=dbq("SELECT file_path FROM books WHERE id=?",(bid,))
+                if not r: self.send_error(404); return
+                fp=_resolve_path(r[0]['file_path'])
+                zp=urllib.parse.unquote(path.split("/epub/asset/",1)[1])
+                try:
+                    zf=_zf_mod.ZipFile(fp); data=zf.read(zp); zf.close()
+                except Exception:
+                    self.send_error(404); return
+                ext=os.path.splitext(zp)[1].lower()
+                ct={'.xhtml':'application/xhtml+xml','.html':'text/html','.htm':'text/html','.css':'text/css','.jpg':'image/jpeg','.jpeg':'image/jpeg','.png':'image/png','.gif':'image/gif','.svg':'image/svg+xml','.webp':'image/webp','.woff':'font/woff','.woff2':'font/woff2','.ttf':'font/ttf','.otf':'font/otf'}.get(ext,'application/octet-stream')
+                self.send_response(200); self.send_header("Content-Type",ct); self.end_headers(); self.wfile.write(data)
+
             elif "/archive/" in path and path.startswith("/api/books/"):
                 # 从压缩包中提取并服务单个文件: /api/books/<id>/archive/<filename>
                 parts = path.split("/archive/", 1)
@@ -1515,6 +2111,20 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
                     with open(fp, 'rb') as f: self.wfile.write(f.read())
                 else:
                     self.send_error(404)
+            elif path.startswith("/epubjs/"):
+                # Serve epub.js static files (epub.min.js + jszip.min.js)
+                rel = path[8:]  # strip "/epubjs/" (8 chars)
+                base = os.path.dirname(os.path.abspath(__file__))
+                fp = os.path.join(base, "epubjs", rel)
+                if os.path.exists(fp) and os.path.isfile(fp):
+                    ext = os.path.splitext(fp)[1].lower()
+                    ct = {'.js':'application/javascript','.css':'text/css','.html':'text/html','.json':'application/json'}.get(ext, 'application/octet-stream')
+                    self.send_response(200)
+                    self.send_header("Content-Type", ct)
+                    self.end_headers()
+                    with open(fp, 'rb') as f: self.wfile.write(f.read())
+                else:
+                    self.send_error(404)
             elif path.startswith("/api/covers/"):
                 cv = Path("data/covers")/path.split("/")[-1]
                 if cv.exists():
@@ -1543,13 +2153,16 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
     def _page(self,qs):
         ct=get_counts()  # 同步刷新统计，确保导入后首页立即显示正确数字
         tb=ct.get('tb',0); tm=ct.get('tm',0)
+        try: tn=dbq("SELECT COUNT(*) AS c FROM reading_notes")[0]['c']
+        except Exception: tn=0
         pn=qs.get('p',['home'])[0]
         cat=qs.get('cat',[''])[0]; sub=qs.get('sub',[''])[0]
-        nv=NAV.replace('{B}',str(tb)).replace('{M}',str(tm)).replace('{TREE}', build_cat_tree(cat, sub)).replace('{SHELVES}', build_shelves())
+        nv=NAV.replace('{B}',str(tb)).replace('{M}',str(tm)).replace('{TREE}', build_cat_tree(cat, sub)).replace('{SHELVES}', build_shelves()).replace('{N}', str(tn))
         h='<!DOCTYPE html><html><head><meta charset=utf-8><title>我的图书馆</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>'+CSS+EXTRA_CSS+'</style></head><body>'+nv+'<div class="topbar"><button class="menu-btn" onclick="toggleNav()">☰</button><span>📚 我的图书馆</span></div><div class="overlay" onclick="toggleNav()"></div><main>'
         if pn=='books':
             q=qs.get('q',[''])[0];cat=qs.get('cat',[''])[0];sub=qs.get('sub',[''])[0];fmt=qs.get('fmt',[''])[0]
             diff=qs.get('diff',[''])[0];rstat=qs.get('rstat',[''])[0]
+            author=qs.get('author',[''])[0];tags=qs.get('tags',[''])[0];year=qs.get('year',[''])[0]
             bp=int(qs.get('page',['1'])[0]);ps=85
             s="SELECT id,title,file_format,file_size,cover_path,reading_status,last_page FROM books WHERE status='active'";pa=[]
             if q:s+=" AND title LIKE ?";pa.append('%'+q+'%')
@@ -1558,6 +2171,9 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             if fmt:s+=" AND file_format=?";pa.append(fmt)
             if diff:s+=" AND difficulty=?";pa.append(diff)
             if rstat:s+=" AND reading_status=?";pa.append(rstat)
+            if author:s+=" AND id IN (SELECT book_id FROM book_authors ba JOIN authors a ON a.id=ba.author_id WHERE a.name LIKE ?)";pa.append('%'+author+'%')
+            if tags:s+=" AND id IN (SELECT book_id FROM book_tags bt JOIN tags t ON t.id=bt.tag_id WHERE t.name LIKE ?)";pa.append('%'+tags+'%')
+            if year:s+=" AND publish_date LIKE ?";pa.append(year+'%')
             total=dbq("SELECT count(*)as c FROM books WHERE "+s.split("WHERE",1)[1],tuple(pa))[0]['c']
             s+=" ORDER BY created_at DESC, title ASC LIMIT "+str(ps)+" OFFSET "+str((bp-1)*ps)
             rows=dbq(s,tuple(pa))
@@ -1582,6 +2198,9 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
                 sel=' selected'if v==diff else''
                 h+='<option value="'+v+'"'+sel+'>'+v+'</option>'
             h+='</select>'
+            h+='<input name=author placeholder=作者 value="'+he(author)+'">'
+            h+='<input name=tags placeholder=标签 value="'+he(tags)+'">'
+            h+='<input name=year placeholder=出版年 value="'+he(year)+'" style="width:90px">'
             h+='<button>搜索</button><button type=button class=sb-btn onclick="saveShelf()">💾 存为书架</button></form>'
             h+='<div class=grid>'
             for r in rows:
@@ -1594,7 +2213,7 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             if total>ps:
                 tp=(total+ps-1)//ps;qs_str=""
                 if q or cat or sub or fmt or diff or rstat:
-                    qs_str="&q="+he(q)+"&cat="+(cat or"")+"&sub="+(sub or"")+"&fmt="+(fmt or"")+"&diff="+(diff or"")+"&rstat="+(rstat or"")
+                    qs_str="&q="+he(q)+"&cat="+(cat or"")+"&sub="+(sub or"")+"&fmt="+(fmt or"")+"&diff="+(diff or"")+"&rstat="+(rstat or"")+"&author="+(author or"")+"&tags="+(tags or"")+"&year="+(year or"")
                 h+='<div style=text-align:center;margin-top:12px;font-size:14px>共 '+str(total)+' 本 页 '+str(bp)+'/'+str(tp)+' '
                 if bp>1:h+='<a href="?p=books&page='+str(bp-1)+qs_str+'">上一页</a> '
                 if bp<tp:h+='<a href="?p=books&page='+str(bp+1)+qs_str+'">下一页</a> '
@@ -1631,6 +2250,10 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
                         h+=' <span class=tag style=background:'+dc.get(b['difficulty'],'#999')+'>难度: '+b['difficulty']+'</span>'
                     if b['summary']:h+='<div class=sec><h3>🤖 AI 摘要</h3><div style=white-space:pre-wrap;line-height:1.8;background:#f9f9f9;padding:16px;border-radius:8px;margin-top:8px>'+he(str(b['summary']))+'</div></div>'
                     else:h+='<div class=sec><p class=co>暂无摘要</p></div>'
+                    # P2-A 阅读笔记
+                    h+='<div class=sec id=notes-sec><h3>📝 阅读笔记</h3><div id=notes-list data-bid="'+bid+'"></div>'
+                    h+='<div style="margin-top:10px"><textarea id=note-input placeholder="写点笔记…（可选填页码）" style="width:100%;min-height:60px;padding:8px;border:1px solid var(--border2);border-radius:6px;font-family:inherit;font-size:14px;background:var(--panel);color:var(--text)"></textarea>'
+                    h+='<div style="margin-top:6px;display:flex;gap:8px;align-items:center"><input id=note-page placeholder="页码(可选)" style="width:110px;padding:6px 8px;border:1px solid var(--border2);border-radius:6px;font-size:13px;background:var(--panel);color:var(--text)"><button class="btn" onclick="addNote(\''+bid+'\')">＋ 保存笔记</button></div></div>'
                     read_url='/api/books/'+bid+'/'+('file'if b['file_format']=='pdf'else'read')
                     cont = (' 续读第'+str(lp)+'页') if (b['file_format']=='pdf' and lp) else ''
                     h+='<div class=sec><a href="'+read_url+'" class=btn target=_blank>📖 阅读'+cont+'</a>'                                                                       #260727 修改 调用SumatraPDF
@@ -1638,6 +2261,31 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
                     _jt=str(b['title']).replace('\\','\\\\').replace("'","\\'").replace('\n',' ')   #260816 删除按钮（标题做JS转义）
                     h+=' <a href="#" class=btn style="background:#ff4d4f;color:#fff" onclick="event.preventDefault();DELB(\''+bid+'\',\''+_jt+'\')">🗑️ 删除</a>'
                     h+=' <a href="javascript:history.back()" class="btn bb2">返回</a></div></div>'
+        elif pn=='notes':
+            q=qs.get('q',[''])[0]
+            s="SELECT n.id,n.note,n.page,n.created_at,n.book_id,b.title FROM reading_notes n LEFT JOIN books b ON b.id=n.book_id"
+            pa=[]
+            if q:
+                s+=" WHERE n.note LIKE ?"; pa.append('%'+q+'%')
+            s+=" ORDER BY n.created_at DESC LIMIT 500"
+            try:
+                rows=dbq(s,tuple(pa))
+            except Exception as e:
+                rows=[]; h+='<p class=co>笔记读取失败: '+he(str(e))+'</p>'
+            h+='<h2>📝 全部阅读笔记 ('+str(len(rows))+')</h2>'
+            h+='<form class=sch method=get><input type=hidden name=p value=notes><input name=q placeholder="搜索笔记内容" value="'+he(q)+'"><button>搜索</button></form>'
+            if rows:
+                h+='<div style="display:flex;flex-direction:column;gap:12px;margin-top:12px">'
+                for r in rows:
+                    bid2=r['book_id'] or ''
+                    title=r['title'] or '(书籍已删除)'
+                    meta=(('第 '+str(r['page'])+' 页 · ') if r['page'] else '')+(str(r['created_at'])[:16] if r['created_at'] else '')
+                    h+='<div style="border:1px solid var(--border2);border-radius:8px;padding:12px 14px;background:var(--panel)">'
+                    h+='<div style="margin-bottom:6px"><a href="/?p=detail&id='+bid2+'" target=_blank style="font-weight:600;color:var(--link);text-decoration:none">'+he(title)[:60]+'</a>'
+                    h+=' <span style="color:#999;font-size:12px">'+he(meta)+'</span></div>'
+                    h+='<div style="white-space:pre-wrap;line-height:1.7;font-size:14px">'+he(str(r['note']))+'</div>'
+                    h+='</div>'
+                h+='</div>'
         elif pn=='media_detail':
             mid=qs.get('id',[''])[0]
             m=dbq("SELECT * FROM media WHERE id=?",(mid,))
@@ -1763,7 +2411,9 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             h+='<div style="margin-bottom:8px"><label style=font-size:13px>分类数量 </label><select id=clsCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=5>5 本</option><option value=10 selected>10 本</option><option value=20>20 本</option><option value=50>50 本</option><option value=100>100 本</option><option value=500>500 本</option><option value=1000>1000 本</option></select> <button class=btn id=clsBtn onclick="CLS()" style=margin-right:8px>🤖 AI 分类</button></div>'
             h+='<div style="margin-bottom:8px"><label style=font-size:13px>摘要数量 </label><select id=sumCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=1>1 本</option><option value=3 selected>3 本</option><option value=5>5 本</option><option value=10>10 本</option><option value=20>20 本</option><option value=100>100 本</option><option value=500>500 本</option><option value=1000>1000 本</option></select> <button class=btn id=sumBtn onclick="SUM()">🤖 AI 摘要</button></div>'
             h+='<div><label style=font-size:13px>提取数量 </label><select id=extCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=5>5 本</option><option value=10 selected>10 本</option><option value=20>20 本</option><option value=50>50 本</option><option value=100>100 本</option><option value=500>500 本</option><option value=1000>1000 本</option></select> <button class=btn id=extBtn onclick="EXT()">📄 提取文本</button></div>'
-            h+='<div id=clsRes style=margin-top:4px;font-size:13px></div><div id=sumRes style=margin-top:4px;font-size:13px></div><div id=extRes style=margin-top:4px;font-size:13px></div></div>'
+            h+='<div style="margin:10px 0 4px;font-size:12px;color:#888;border-top:1px dashed #eee;padding-top:8px">🌐 在线元数据补全（需联网 Open Library / Google Books；默认未启用，设置 LIB_METADATA_ONLINE=1 重启后可用）</div>'
+            h+='<div style="margin-bottom:8px"><label style=font-size:13px>元数据数量 </label><select id=metaCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=0 selected>全部</option><option value=10>10 本</option><option value=50>50 本</option><option value=100>100 本</option><option value=500>500 本</option><option value=1000>1000 本</option></select> <button class=btn id=metaBtn onclick="META()" style=background:#13c2c2>🌐 补全元数据</button></div>'
+            h+='<div id=clsRes style=margin-top:4px;font-size:13px></div><div id=sumRes style=margin-top:4px;font-size:13px></div><div id=extRes style=margin-top:4px;font-size:13px></div><div id=metaRes style=margin-top:4px;font-size:13px></div></div>'
             #媒体库转录、摘要面板20260801
             h+='<div class=panel><h3>🎙️ 媒体转录与摘要</h3><p class=co style=margin-bottom:8px>待转录: '+str(tm - ct.get("mtr",0))+' 个 | 已转录待摘要: '+str(ct.get("mtr",0) - ct.get("msu",0))+' 个</p>'
             h+='<div style="margin-bottom:8px"><label style=font-size:13px>转录数量 </label><select id=trsCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=5>5 个</option><option value=10 selected>10 个</option><option value=50>50 个</option><option value=100>100 个</option><option value=500>500 个</option></select> <select id=trsType style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=all>全部媒体</option><option value=audio>仅音频</option><option value=video>仅视频</option></select> <button class=btn id=trsBtn onclick="TRS()">🎙️ 媒体转录</button></div>'
@@ -1829,12 +2479,15 @@ def fix_drive_paths():
         print(f"⚠️ 盘符修正出错: {e}", flush=True)
 
 if __name__ == "__main__":
+    import threading
     fix_drive_paths()
     migrate_schema()
+    threading.Thread(target=migrate_text_content, daemon=True).start()
     HOST = os.environ.get("LIB_HOST", "127.0.0.1")
     PORT = int(os.environ.get("LIB_PORT", "8000"))
     print(f"🚀 http://localhost:{PORT}")
     print(f"📚 Private Lib | listening on {HOST}:{PORT}")
     if HOST == "0.0.0.0":
         print("⚠️  监听所有网卡（局域网可访问）。仅限 127.0.0.1 请设 LIB_HOST=127.0.0.1")
+    print("[migrate] 12GB 文本搬迁已在后台启动，界面可立即使用；AI 文本功能待搬迁完成后生效", flush=True)
     http.server.ThreadingHTTPServer((HOST, PORT), H).serve_forever()

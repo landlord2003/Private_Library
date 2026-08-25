@@ -9,6 +9,14 @@ set "LIB_DRIVE=%~d0"
 :: 监听所有网卡，允许手机/局域网访问。仅本机访问请改回 127.0.0.1
 set "LIB_HOST=0.0.0.0"
 
+:: 在线元数据补全（回填书名/出版社/简介/ISBN）。需能访问境外接口 openlibrary.org / googleapis.com
+:: 默认开启；如不需要可改为 0 或直接注释本行
+set "LIB_METADATA_ONLINE=1"
+:: 身处需代理的网络时（如国内直连境外站超时），取消下一行注释并填入你的代理地址
+:: urllib 会自动读取 HTTP_PROXY / HTTPS_PROXY 环境变量
+:: set "HTTPS_PROXY=http://127.0.0.1:7890"
+:: set "HTTP_PROXY=http://127.0.0.1:7890"
+
 echo ╔══════════════════════════════════╗
 echo ║      📚 个人电子图书馆             ║
 echo ╚══════════════════════════════════╝
