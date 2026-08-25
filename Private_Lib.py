@@ -1222,21 +1222,21 @@ def _sim(a, b):
     return difflib.SequenceMatcher(None, _clean_title(a), _clean_title(b)).ratio()
 
 def _http_get_json(url, timeout=5):
-    """标准库 urllib 发 GET，自动读取 HTTP_PROXY/HTTPS_PROXY 环境变量（复用 git 代理）。失败返回 None。"""
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (PrivateLib)"})
-        proxy = urllib.request.ProxyHandler(urllib.request.getproxies())
-        opener = urllib.request.build_opener(proxy)
-        with opener.open(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", "ignore"))
-    except Exception as e:
-        print(f"[元数据HTTP失败] {url[:80]}: {type(e).__name__}: {e}", flush=True)
-        return None
+    """标准库 urllib 发 GET，自动读取 HTTP_PROXY/HTTPS_PROXY 环境变量（复用 git 代理）。失败抛出异常（由调用方按场景处理）。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (PrivateLib)"})
+    proxy = urllib.request.ProxyHandler(urllib.request.getproxies())
+    opener = urllib.request.build_opener(proxy)
+    with opener.open(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "ignore"))
+
+_google_cooldown_until = 0.0  # Google Books 命中 429 后的冷却时间戳，避免共享 IP 连环限流
 
 def fetch_online_metadata(title, author=None, isbn=None):
     """在线补全单本书元数据（Open Library 优先 + Google Books 兜底，均无需 key）。
     返回 dict: {publisher,publish_date,isbn,language,description,source,sim} 或 None。
-    仅用于填空字段；sim 为书名相似度，ISBN 命中时置 1.0。"""
+    仅用于填空字段；sim 为书名相似度，ISBN 命中时置 1.0。
+    说明：免费 API 对中文书覆盖有限；Google Books 共享 IP 易 429，已加冷却与超时保护。"""
+    global _google_cooldown_until
     if not ENABLE_ONLINE_METADATA:
         return None
     title = (title or "").strip()
@@ -1244,7 +1244,7 @@ def fetch_online_metadata(title, author=None, isbn=None):
         return None
     result = None
     best_sim = 0.0
-    # 1) Open Library
+    # 1) Open Library（主源，英文/知名书覆盖好；拉长超时应对国内网络抖动）
     try:
         ol = None
         if isbn:
@@ -1283,9 +1283,10 @@ def fetch_online_metadata(title, author=None, isbn=None):
                       "description": (desc or "")[:2000], "source": "openlibrary", "sim": best_sim}
     except Exception as e:
         print(f"[OL失败] {title[:30]}: {e}", flush=True)
-    # 2) Google Books 兜底（补 description / 未匹配时）
+    # 2) Google Books 兜底（仅在 OL 无描述 且 未处于 429 冷却时调用，避免共享 IP 被限流）
     try:
-        if (not result) or (not result.get("description")) or (title and best_sim < 0.8):
+        need_google = (not result) or (not result.get("description")) or (title and best_sim < 0.7)
+        if need_google and time.time() > _google_cooldown_until:
             gq = title + (" " + author if author else "")
             g = _http_get_json("https://www.googleapis.com/books/v1/volumes?q=" + urllib.parse.quote(gq) + "&maxResults=5", timeout=5)
             items = (g or {}).get("items", [])
@@ -1310,8 +1311,29 @@ def fetch_online_metadata(title, author=None, isbn=None):
                     merged["description"] = (merged["description"] or "")[:2000]
                     result = merged
     except Exception as e:
-        print(f"[GB失败] {title[:30]}: {e}", flush=True)
+        msg = str(e)
+        if "429" in msg:
+            _google_cooldown_until = time.time() + 120  # 命中限流，冷却 2 分钟，期间跳过 Google
+            print(f"[GB 429 冷却] {title[:20]}: 2分钟内跳过 Google", flush=True)
+        else:
+            print(f"[GB失败] {title[:30]}: {e}", flush=True)
     return result
+
+def _fetch_meta_timeout(title, author, isbn, timeout=15):
+    """在独立线程里跑 fetch_online_metadata，硬性超时返回 None，避免外部 API 挂死拖垮整批。"""
+    box = {}
+    def _run():
+        try:
+            box['v'] = fetch_online_metadata(title, author, isbn)
+        except Exception as e:
+            print(f"[元数据线程异常] {title[:24]}: {type(e).__name__}: {e}", flush=True)
+            box['v'] = None
+    th = threading.Thread(target=_run, daemon=True); th.start()
+    th.join(timeout)
+    if th.is_alive():
+        print(f"[元数据硬超时跳过] {title[:24]}", flush=True)
+        return None
+    return box.get('v')
 
 def run_metadata_async(count=None):
     """异步批量补全在线元数据。count=None 表示全库扫描（默认回填存量）。
@@ -1323,20 +1345,24 @@ def run_metadata_async(count=None):
     _task_status['mr_r'] = {"done":0,"total":0,"filled":0,"skipped":0}
     def w():
         try:
-            sql = ("SELECT id,title,author,publisher,isbn,language,description FROM books "
-                   "WHERE status='active' AND (publisher IS NULL OR publisher='') "
-                   "AND (isbn IS NULL OR isbn='') AND (description IS NULL OR description='')")
+            sql = ("SELECT b.id,b.title,b.publisher,b.isbn,b.language,b.description,"
+                   "MAX(a.name) AS author FROM books b "
+                   "LEFT JOIN book_authors ba ON ba.book_id=b.id "
+                   "LEFT JOIN authors a ON a.id=ba.author_id "
+                   "WHERE b.status='active' AND (b.publisher IS NULL OR b.publisher='') "
+                   "AND (b.isbn IS NULL OR b.isbn='') AND (b.description IS NULL OR b.description='') "
+                   "GROUP BY b.id")
             if count:
                 sql += " LIMIT %d" % int(count)
             books = dbq(sql)
             rv = {"done":0,"total":len(books),"filled":0,"skipped":0}
             for b in books:
                 try:
-                    meta = fetch_online_metadata(b['title'], b.get('author'), b.get('isbn'))
+                    meta = _fetch_meta_timeout(b['title'], b.get('author'), b.get('isbn'))
                     if meta:
                         sim = meta.get("sim", 0)
                         isbn_match = bool(b.get('isbn')) and meta.get("isbn") and b['isbn'].replace("-","")==meta["isbn"].replace("-","")
-                        trusted = isbn_match or sim >= 0.8 or (sim >= 0.6 and meta.get("description"))
+                        trusted = isbn_match or sim >= 0.7 or (sim >= 0.55 and meta.get("description")) or (sim >= 0.6 and meta.get("publisher"))
                         if trusted:
                             sets = []; params = []
                             for col in ("publisher","publish_date","isbn","language","description"):
@@ -1805,7 +1831,7 @@ class H(http.server.SimpleHTTPRequestHandler):
         p=urllib.parse.urlparse(self.path); path=p.path; qs=urllib.parse.parse_qs(p.query)
         try:
             if path=="/api/health": self.json({"status":"ok"})
-            elif path=="/api/task-status": self.json({"classify":_task_status.get('cr_r',{}),"summarize":_task_status.get('sr_r',{}),"extract":_task_status.get('er_r',{}),"transcribe":_task_status.get('tr_r',{}),"media_summarize":_task_status.get('ms_r',{}),"scan_import":_task_status.get('ir_r',{}),"metadata":_task_status.get('mr',{})})
+            elif path=="/api/task-status": self.json({"classify":_task_status.get('cr_r',{}),"summarize":_task_status.get('sr_r',{}),"extract":_task_status.get('er_r',{}),"transcribe":_task_status.get('tr_r',{}),"media_summarize":_task_status.get('ms_r',{}),"scan_import":_task_status.get('ir_r',{}),"metadata":_task_status.get('mr_r',{})})
             elif path.startswith("/api/books/") and path.endswith("/notes"):
                 bid=path.split("/")[3]
                 rows=dbq("SELECT id,note,page,created_at FROM reading_notes WHERE book_id=? ORDER BY created_at DESC",(bid,))
