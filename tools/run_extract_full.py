@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+# 健壮版全量文本抽取（替代服务端单线程 run_extract_async）。
+# - 多线程(max_workers) 避免单本 fitz 卡死阻塞全量
+# - 每本硬超时(60s)，超时被丢弃并标记 skip，不影响其他书
+# - 进度落盘(_extract_run.log)，可续跑：重抽 text_content<=10 或 NULL 且 text_extracted<>1 的书
+import sys, os, time, sqlite3, traceback, concurrent.futures as cf
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import Private_Lib as P
+
+DB = r"F:/my-library/data/library.db"
+LOG = r"F:/my-library/tools/_extract_run.log"
+WORKERS = 4
+PER_BOOK_TIMEOUT = 60
+
+logf = open(LOG, "a", encoding="utf-8")
+def L(*a):
+    s = " ".join(str(x) for x in a)
+    print(s, flush=True); logf.write(s + "\n"); logf.flush()
+
+def work(bid, fpath, ff):
+    try:
+        ok = P.extract_text_for(bid, fpath, ff)
+        return (bid, True if ok else False, None)
+    except Exception as e:
+        return (bid, False, f"{type(e).__name__}: {e}")
+
+def main():
+    con = sqlite3.connect(DB, timeout=30)
+    # 仅按 text_extracted 标志筛选：text_extracted=1 的书必有真实正文，其余(text_extracted=0/NULL)都需(重)抽取。
+    # 不再扫 book_text 的 length()（会读全量 3GB 文本导致 MemoryError）。
+    q = """SELECT b.id,b.file_path,b.file_format FROM books b
+           WHERE b.status='active' AND b.text_extracted<>1"""
+    rows = con.execute(q).fetchall()
+    con.close()
+    L(f"[start] candidates={len(rows)} workers={WORKERS} timeout={PER_BOOK_TIMEOUT}s")
+    done = extracted = skipped = 0
+    t0 = time.time()
+    with cf.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futs = {ex.submit(work, r[0], r[1], r[2]): r for r in rows}
+        for fut in cf.as_completed(futs):
+            try:
+                bid, ok, err = fut.result(timeout=PER_BOOK_TIMEOUT)
+            except cf.TimeoutError:
+                bid = futs[fut][0]
+                skipped += 1; done += 1
+                L(f"  timeout {bid[:8]} (fitz hang, skipped)"); continue
+            done += 1
+            if ok:
+                extracted += 1
+            else:
+                skipped += 1
+                if err: L(f"  skip {bid[:8]}: {err}")
+            if done % 50 == 0:
+                dt = time.time() - t0
+                L(f"[prog] done={done}/{len(rows)} extracted={extracted} skipped={skipped} elapsed={dt:.0f}s rate={done/dt:.1f}/s")
+    L(f"[done] total={len(rows)} extracted={extracted} skipped={skipped} elapsed={time.time()-t0:.0f}s")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        L("FATAL"); traceback.print_exc(file=logf)
