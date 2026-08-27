@@ -1,4 +1,4 @@
 {
-  "storage_mode": "copy",
+  "storage_mode": "reference",
   "scan_directories": ["F:/书籍"]
 }

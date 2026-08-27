@@ -1,0 +1,7 @@
+{
+  "proxy": "",
+  "ollama_model": "qwen2.5:7b",
+  "ollama_host": "http://localhost:11434",
+  "default_limit": 200,
+  "kg_vault": ""
+}

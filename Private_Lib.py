@@ -93,6 +93,78 @@ def set_text(book_id, text):
         "ON CONFLICT(id) DO UPDATE SET text_content=excluded.text_content",
         (book_id, text))
 
+def _pg():
+    """续跑进度引擎：复用 tools/libtools_common 的 progress.db。不可用时优雅降级(返回None)。"""
+    try:
+        _td = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools")
+        if _td not in sys.path: sys.path.insert(0, _td)
+        import libtools_common as L
+        pc = L.get_progress_conn(); L.ensure_progress(pc)
+        return pc, L
+    except Exception as e:
+        print(f"[progress引擎不可用] {e}", flush=True)
+        return None, None
+
+def _mark(tool, bid, status):
+    """标记某书/媒体在某工具下的续跑进度(done/skip/partial)。引擎缺失则静默跳过。"""
+    pc, L = _pg()
+    if pc:
+        try: L.mark_progress(pc, bid, tool, status)
+        except Exception: pass
+
+_tool_procs = {}
+
+def _tool_run(data):
+    """启动离线工具（tools/ 脚本）为独立后台进程。进度写 progress.db，主服务重启不影响续跑。"""
+    import subprocess as _sp
+    d = data or {}
+    tool = d.get('tool')
+    if not tool:
+        return {"ok": False, "msg": "缺少 tool 参数"}
+    base = os.path.dirname(os.path.abspath(__file__))
+    td = os.path.join(base, "tools")
+    lim = int(d.get('limit') or 0) or 200
+    regen = bool(d.get('regen'))
+    py = sys.executable
+    if tool == 'kg':
+        cmd = [py, os.path.join(td, "kg_build.py"), "--mode", "l1", "--limit", str(lim)] + (["--regen"] if regen else [])
+    elif tool == 'meta':
+        if regen:
+            cmd = [py, os.path.join(td, "meta_complete.py"), "--retry-skips", "--limit", str(lim)]
+        else:
+            cmd = [py, os.path.join(td, "meta_complete.py"), "--mode", (d.get('mode') or 'fast'), "--limit", str(lim)]
+    elif tool == 'summary':
+        cmd = [py, os.path.join(td, "summary_fix.py"), "--mode", "all", "--limit", str(lim)]
+    else:
+        return {"ok": False, "msg": "未知工具: " + str(tool)}
+    if _tool_procs.get(tool) and _tool_procs[tool].poll() is None:
+        return {"ok": False, "msg": f"{tool} 已在运行 (PID {_tool_procs[tool].pid})"}
+    logp = os.path.join(td, tool + ".log")
+    try:
+        f = open(logp, "a", encoding="utf-8")
+        cf = 0x08000000 if os.name == 'nt' else 0
+        p = _sp.Popen(cmd, stdout=f, stderr=_sp.STDOUT, creationflags=cf)
+        _tool_procs[tool] = p
+        return {"ok": True, "msg": f"{tool} 已启动 PID {p.pid}，日志 {logp}"}
+    except Exception as e:
+        return {"ok": False, "msg": f"启动失败: {e}"}
+
+def _tool_status():
+    """读取 progress.db 中各离线工具续跑进度 + 运行态。"""
+    pc, L = _pg()
+    out = {}
+    tools = ['kg','meta','summary','extract','classify','summarize','transcribe','media_summarize','metadata']
+    for t in tools:
+        done = skip = 0
+        if pc:
+            try:
+                done = pc.execute("SELECT COUNT(*) FROM tool_progress WHERE tool=? AND status='done'", (t,)).fetchone()[0]
+                skip = pc.execute("SELECT COUNT(*) FROM tool_progress WHERE tool=? AND status='skip'", (t,)).fetchone()[0]
+            except Exception: pass
+        running = bool(_tool_procs.get(t) and _tool_procs[t].poll() is None)
+        out[t] = {"done": done, "skip": skip, "running": running}
+    return out
+
 def migrate_schema():
     """P0：阅读进度(reading_status/last_page) + 智能书架(shelves)。幂等，可在启动时安全重复调用。"""
     c = sqlite3.connect(DB, timeout=30)
@@ -104,6 +176,8 @@ def migrate_schema():
         ("last_read_at", "TEXT DEFAULT ''"),
         ("metadata_source", "TEXT DEFAULT ''"),
         ("metadata_conf", "REAL DEFAULT 0"),
+        ("normalized_title", "TEXT DEFAULT ''"),
+        ("text_extracted", "INTEGER DEFAULT 0"),
     ]:
         if col not in cols:
             cur.execute("ALTER TABLE books ADD COLUMN %s %s" % (col, ddl))
@@ -184,7 +258,7 @@ def cc(c): return {'计算机与编程':'#1677ff','历史与人文':'#fa8c16','�
 
 CSS = """* { margin:0; padding:0; box-sizing:border-box; } body { font-family: "Microsoft YaHei", Arial, sans-serif; background: #f5f5f5; display: flex; min-height: 100vh; } nav { width: 250px; background: #fff; padding: 20px 0; box-shadow: 2px 0 8px rgba(0,0,0,0.05); } nav h2 { padding: 0 20px 20px; color: #1677ff; font-size: 18px; border-bottom: 1px solid #f0f0f0; margin-bottom: 10px; } nav a { display: block; padding: 12px 20px; color: #333; text-decoration: none; font-size: 15px; } nav a:hover { background: #e6f4ff; color: #1677ff; } main { flex: 1; padding: 24px; overflow-y: auto; } .sb { background: #fff; padding: 20px; border-radius: 8px; text-align: center; min-width: 140px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); text-decoration: none; color: inherit; } .sb .n { font-size: 28px; font-weight: bold; } .sb .l { font-size: 13px; color: #999; margin-top: 4px; } .row { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; } .tag { display: inline-block; padding: 3px 10px; border-radius: 4px; font-size: 12px; margin: 3px; color: #fff; } .panel { background: #fff; padding: 16px; border-radius: 8px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); } .panel h3 { margin-bottom: 12px; font-size: 16px; } .sch { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; } .sch input, .sch select { padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; } .sch input { flex: 1; min-width: 180px; } .sch button { padding: 8px 20px; background: #1677ff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; } .bk { background: #fff; border-radius: 8px; padding: 14px; margin-bottom: 8px; display: flex; gap: 12px; align-items: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05); cursor: pointer; } .bk:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.1); } .bk img { width: 50px; height: 70px; object-fit: cover; border-radius: 4px; flex-shrink: 0; } .bk .cv { width: 50px; height: 70px; border-radius: 4px; flex-shrink: 0; background: linear-gradient(135deg, #667eea, #764ba2); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 22px; } .bk .info { flex: 1; min-width: 0; } .bk .t { font-weight: bold; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .bk .m { font-size: 12px; color: #999; margin-top: 2px; } a { color: #1677ff; text-decoration: none; } a:hover { text-decoration: underline; } .co { color: #999; } .btn { padding: 8px 20px; background: #1677ff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; margin: 2px; } .bb2 { background: #fff; color: #1677ff; border: 1px solid #1677ff; } .detail { background: #fff; border-radius: 12px; padding: 24px; max-width: 800px; margin: 0 auto; box-shadow: 0 2px 12px rgba(0,0,0,0.1); overflow: hidden; } .detail h1 { margin-bottom: 16px; font-size: 22px; margin-right: 170px; } .detail .meta { margin-bottom: 16px; color: #666; font-size: 14px; line-height: 1.8; margin-right: 170px; } .detail .sec { margin: 16px 0; } .detail-cover { float: right; width: 150px; height: 200px; object-fit: contain; border-radius: 8px; background: #f5f5f5; margin-left: 16px; } .detail-cv { float: right; width: 150px; height: 200px; border-radius: 8px; background: linear-gradient(135deg, #667eea, #764ba2); display: flex; align-items: center; justify-content: center; color: #fff; font-size: 48px; margin-left: 16px; }"""
 
-NAV = '<nav><h2>📚 我的图书馆</h2><a href="/">🏠 首页</a><a href="/?p=books">📖 书库 ({B})</a><a href="/?p=media">🎧 媒体库 ({M})</a><a href="/?p=import">📥 导入新书</a><a href="/?p=notes">📝 笔记 ({N})</a><div class="cat-tree">{TREE}</div><div class="shelf-box">{SHELVES}</div><div class="theme-row"><button class="theme-btn" onclick="toggleTheme()" title="切换深浅色">🌙 深色</button></div></nav>'
+NAV = '<nav><h2>📚 我的图书馆</h2><a href="/">🏠 首页</a><a href="/?p=books">📖 书库 ({B})</a><a href="/?p=media">🎧 媒体库 ({M})</a><a href="/?p=import">📥 导入新书</a><a href="/?p=notes">📝 笔记 ({N})</a><a href="/?p=tools">🛠️ 工具中心</a><div class="cat-tree">{TREE}</div><div class="shelf-box">{SHELVES}</div><div class="theme-row"><button class="theme-btn" onclick="toggleTheme()" title="切换深浅色">🌙 深色</button></div></nav>'
 
 EXTRA_CSS = """
 .cat-tree{padding:8px 0 14px;border-top:1px solid #f0f0f0;margin-top:6px;max-height:calc(100vh - 220px);overflow-y:auto}
@@ -964,7 +1038,10 @@ def _epub_chapter_html(fp, zip_path, bid):
     return _re_mod.sub(r'(src|href)="([^"]+)"', rw, html, flags=_re_mod.I)
 
 def _title_fallback(book_id):
-    """Use book metadata as minimal text for books that can't be extracted."""
+    """Use book metadata as minimal text for books that can't be extracted.
+    此路径代表“无真实正文”，故标记 text_extracted=0，供摘要/分类入口跳过、不生成假内容。"""
+    try: dbe("UPDATE books SET text_extracted=0 WHERE id=?", (book_id,))
+    except Exception: pass
     r = dbq("SELECT title,publisher,description FROM books WHERE id=?",(book_id,))
     if r:
         parts = [r[0]['title'] or '']
@@ -974,7 +1051,37 @@ def _title_fallback(book_id):
         if text.strip():
             set_text(book_id, text[:200000])
             return True
-    return False
+        return False
+
+def _ocr_pdf(file_path, max_pages=15):
+    """扫描版PDF的OCR兜底。需主机安装 tesseract(+中文语言包 chi_sim)；缺失则优雅返回 ''，由调用方回落书名。"""
+    import shutil as _sh, subprocess as _sp, tempfile, os as _os
+    ts = _sh.which("tesseract") or _sh.which("tesseract.exe")
+    if not ts:
+        return ""
+    try:
+        import fitz
+        doc = fitz.open(file_path)
+        pages = min(max_pages, doc.page_count)
+        texts = []
+        for i in range(pages):
+            pix = doc[i].get_pixmap(dpi=200)
+            tmp = _os.path.join(tempfile.gettempdir(), "lib_ocr_%d.png" % i)
+            pix.save(tmp)
+            try:
+                r = _sp.run([ts, tmp, "stdout", "-l", "chi_sim+eng"], capture_output=True, text=True, timeout=120)
+                if r.returncode == 0:
+                    texts.append(r.stdout)
+            except Exception:
+                pass
+            finally:
+                try: _os.remove(tmp)
+                except Exception: pass
+        doc.close()
+        return "\n".join(texts)
+    except Exception as e:
+        print(f"[OCR异常] {file_path}: {e}", flush=True)
+        return ""
 
 def extract_text_for(book_id, file_path, fmt):
     try:
@@ -1003,10 +1110,15 @@ def extract_text_for(book_id, file_path, fmt):
                 if i >= max_pages: break
                 text += page.get_text()
             doc.close()
-            # Scanned PDF fallback: use title as minimal text
+            # Scanned PDF fallback: try OCR, then title
             if not text.strip():
-                print(f"[扫描版PDF] 无文字层, 用书名兜底: {title_short}", flush=True)
-                return _title_fallback(book_id)
+                ocr = _ocr_pdf(file_path, max_pages=15)
+                if ocr.strip():
+                    text = ocr
+                    print(f"[扫描版PDF] OCR 获取 {len(ocr)} 字: {title_short}", flush=True)
+                else:
+                    print(f"[扫描版PDF] 无文字层且OCR不可用, 用书名兜底: {title_short}", flush=True)
+                    return _title_fallback(book_id)
         elif fmt == 'epub':
             # Use zipfile to read EPUB directly (more robust than ebooklib)
             import zipfile
@@ -1026,10 +1138,24 @@ def extract_text_for(book_id, file_path, fmt):
             try:
                 import mobi
                 tempdir, filepath = mobi.extract(file_path)
-                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                    text = f.read()
-                shutil.rmtree(tempdir, ignore_errors=True)
-            except: pass
+                try:
+                    raw = open(filepath, 'r', encoding='utf-8', errors='ignore').read()
+                    from bs4 import BeautifulSoup
+                    text = BeautifulSoup(raw, 'html.parser').get_text()
+                finally:
+                    shutil.rmtree(tempdir, ignore_errors=True)
+            except Exception:
+                # 尝试 calibre ebook-convert（若主机安装）
+                cb = shutil.which("ebook-convert") or shutil.which("ebook-convert.exe")
+                if cb:
+                    try:
+                        import tempfile, subprocess as _sp
+                        out = tempfile.mktemp(suffix=".txt")
+                        _sp.run([cb, file_path, out], capture_output=True, timeout=300)
+                        if os.path.exists(out):
+                            text = open(out, 'r', encoding='utf-8', errors='ignore').read()
+                            os.remove(out)
+                    except Exception: pass
         elif fmt in ('rar', 'zip', '7z'):
             # Extract archive, find book files inside
             import zipfile, tempfile
@@ -1080,6 +1206,8 @@ def extract_text_for(book_id, file_path, fmt):
         if text and len(text.strip()) > 10:
             text = text[:200000]
             set_text(book_id, text)
+            try: dbe("UPDATE books SET text_extracted=1 WHERE id=?", (book_id,))
+            except Exception: pass
             return True
         # Fallback: use title if extraction yielded nothing
         return _title_fallback(book_id)
@@ -1108,6 +1236,7 @@ def run_extract_async(count=10):
                             ok = _title_fallback(b['id'])
                     if ok:
                         rv["done"]+=1; _task_status['er_r']=rv
+                    _mark('extract', b['id'], 'done' if ok else 'skip')
                 except Exception as e: print(f"[批量提取异常] {b['title'][:30]}: {type(e).__name__}: {e}",flush=True)
             _task_status['er_r']=rv
         finally:
@@ -1169,7 +1298,7 @@ def run_classify_async(count=10):
                         tid=tr[0]['id'] if tr else str(uuid.uuid4()); dbe("INSERT INTO tags(id,name) VALUES(?,?)",(tid,tn)) if not tr else None
                         dbe("INSERT OR IGNORE INTO book_tags(book_id,tag_id) VALUES(?,?)",(b['id'],tid))
                     if result.get("difficulty"): dbe("UPDATE books SET difficulty=? WHERE id=? AND difficulty IS NULL",(result["difficulty"],b['id']))
-                    rv["done"]+=1; _task_status['cr_r']=rv
+                    rv["done"]+=1; _task_status['cr_r']=rv; _mark('classify', b['id'], 'done')
                 except Exception as e: print(f"[分类异常] {b['title'][:30]}: {type(e).__name__}: {e}",flush=True)
             _task_status['cr_r']=rv
         finally:
@@ -1184,7 +1313,7 @@ def run_summarize_async(count=3):
     _task_status['sr_r'] = {"done":0,"total":0}
     def w():
         try:
-            books=dbq("SELECT b.id,b.title,t.text_content FROM books b JOIN book_text t ON t.id=b.id WHERE b.status='active' AND b.summary IS NULL LIMIT ?",(int(count),))
+            books=dbq("SELECT b.id,b.title,t.text_content FROM books b JOIN book_text t ON t.id=b.id WHERE b.status='active' AND b.summary IS NULL AND b.text_extracted=1 LIMIT ?",(int(count),))
             rv={"done":0,"total":len(books)}
             for b in books:
                 try:
@@ -1195,7 +1324,7 @@ def run_summarize_async(count=3):
                         if "高级" in summary: dbe("UPDATE books SET difficulty='高级' WHERE id=? AND difficulty IS NULL",(b['id'],))
                         elif "中级" in summary: dbe("UPDATE books SET difficulty='中级' WHERE id=? AND difficulty IS NULL",(b['id'],))
                         elif "入门" in summary: dbe("UPDATE books SET difficulty='入门' WHERE id=? AND difficulty IS NULL",(b['id'],))
-                        rv["done"]+=1; _task_status['sr_r']=rv
+                        rv["done"]+=1; _task_status['sr_r']=rv; _mark('summarize', b['id'], 'done')
                 except Exception as e: print(f"[摘要异常] {b['title'][:30]}: {type(e).__name__}: {e}",flush=True)
             _task_status['sr_r']=rv
         finally:
@@ -1221,33 +1350,120 @@ def _sim(a, b):
     import difflib
     return difflib.SequenceMatcher(None, _clean_title(a), _clean_title(b)).ratio()
 
-def _http_get_text(url, timeout=8):
-    """标准库 urllib 发 GET 返回文本（用于 HTML 页面，如豆瓣详情页）。失败抛异常。"""
+def _http_get_text(url, timeout=8, max_bytes=None):
+    """标准库 urllib 发 GET 返回文本（用于 HTML 页面，如豆瓣详情页）。失败抛异常。
+    max_bytes: 限制读取字节数，用于大页面只取头部元数据（出版社/ISBN/简介均在前部），
+    避免慢速连接下整页下载过久拖垮批量补全。"""
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept-Language": "zh-CN,zh;q=0.9"})
-    proxy = _proxy_handler()
+    proxy = _proxy_handler(url)
     opener = urllib.request.build_opener(proxy)
     with opener.open(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", "ignore")
+        data = r.read(max_bytes) if max_bytes else r.read()
+        return data.decode("utf-8", "ignore")
 
 
 # 书名后缀/修饰词，检索时应剥离以提高 subject_suggest 命中率
 _TITLE_SUFFIX = r'(丛书|全集|套书|套装|上下册|上册|下册|卷[一二三四五六七八九十百]+|第[0-9一二三四五六七八九十百]+版|含目录|扫描版|精装|修订版|增补版|译著|校订|注释|导读|图说|图鉴|简明|新版|影印|标点|校注|（中）|（上）|（下）)'
 
-def _title_query_variants(title):
-    """生成多个检索变体：去来源标记/括号 → 主标题 → 去后缀修饰词 → 取前N字。
-    subject_suggest 是书名前缀匹配接口，对长书名/丛书后缀极挑剔，多变体逐一尝试可大幅提升命中。"""
-    t = title or ''
-    t = _re_mod.sub(r'\((?:Z-?Library|z-?lib\.org|Z-?Libra[^)]*)\)', '', t, flags=_re_mod.I)
+# 促销/来源废话起始词：出现即截断主书名（仅当不在标题最开头，避免误切真书名如“畅销书写作”）
+_TITLE_PROMO_CUT = ['英国大使馆', '美国大使馆', '官方微博', '活动用书', '豆瓣高分']
+
+def normalize_title(title):
+    """清洗导入残留的脏标题为「可匹配主书名」，仅用于在线元数据检索，绝不改原 title。
+    策略（保守、可回滚：仅加列、不覆盖 title；清洗过度则回退原标题）：
+      1) 剥来源/镜像站点标记（Z-Library / z-lib.org/.sk / 1lib.sk / libgen / b-ok / bookzz 及裸标）；
+      2) 括号内整段镜像域名列表（如 (z-library.sk, 1lib.sk, z-lib.sk)）；
+      3) 前缀随机数字ID（≥5位，避开4位年份区间如1949-1952）；
+      3b) 开头序号数字紧贴中文（如 27想象的→想象的）；
+      4) 迭代剥括号内作者/译者/制作/丛书/年份（处理嵌套括号）；
+      5) 去【…】促销括号（任意长度）及国籍标记【美】/【英】…、[美]/[英]…；
+      6) 截断首个未闭合【及其后促销内容；
+      7) 去尾部无闭合括号残留；
+      8) 去 " by 作者" 英文作者后缀（含 [国籍]，直到行尾/括号/来源描述）；
+      9) = 截断取中文主书名（左侧含≥2汉字时，去掉英文/拼音副书名）；
+     10) 删连续≥2个拉丁词的拼音/纯英文噪音块（如 "Wen ge qian de ..."）；
+     11) 去文件扩展名（.pdf/.epub/.mobi…）；
+     12) 去 "-出版社/引进/出版/译丛/丛书" 等来源描述；
+     13) 在首个促销起始词处截断主书名（仅非开头）；
+     14) 压缩空格、去首尾标点；空则回退原标题。"""
+    t = (title or '').strip()
+    if not t:
+        return t
+    # 1) 括号内整段镜像域名列表（先删，避免裸标规则破坏结构）： (z-library.sk, 1lib.sk, z-lib.sk)
+    t = _re_mod.sub(r'(?i)[\(（][^（）()]*?(?:z-?lib|1lib|b-?ok|bookzz|zlibrary|libgen)[^（）()]*?[）)]', '', t)
+    # 2) 来源/站点标记（含括号与裸标）
+    t = _re_mod.sub(r'(?i)\s*[\(（]?(?:Z-?Library|z-?lib(?:\.org|\.sk)?|1lib\.sk|libgen|b-?ok|bookzz|bok\.cc|z-lib)[\)）]?', '', t)
+    t = t.strip()
+    # 3) 前缀随机数字ID（≥5位，避开"1949-1952"这类4位年份区间）：3202915_ / 123456-
+    t = _re_mod.sub(r'^\d{5,}[_\.\-]?\s*', '', t)
+    # 3b) 开头序号（27想象的→想象的；排除 4位+连字符年份区间如 1949-1952）
+    t = _re_mod.sub(r'^(?!\d{4}[-—–])\d{1,4}(?=[^\d])', '', t)
+    # 4) 迭代剥括号（处理嵌套）：括号内多为作者/译者/丛书/年份/版次
+    for _ in range(6):
+        new = _re_mod.sub(r'[（(][^（）()]*[）)]', '', t)
+        if new == t:
+            break
+        t = new
+    # 5) 【…】促销括号（任意长度）
     t = _re_mod.sub(r'【[^】]*】', '', t)
-    t = _re_mod.sub(r'[（(][^()（]*[）)]', '', t).strip()
-    head = _re_mod.split(r'[\s:：—-]', t)[0].strip() or t
-    vs = [head]
+    # 5b) 国籍标记 【美】/【英】… 及 [美]/[英]…（不在括号内时）
+    t = _re_mod.sub(r'[【\[](?:美|英|法|日|德|加|澳|俄|意|西|韩|中|台)[】\]]', '', t)
+    # 6) 截断首个未闭合【（其后皆为促销）
+    _bi = t.find('【')
+    if _bi >= 0:
+        t = t[:_bi]
+    # 7) 尾部无闭合括号残留：(... 或 （...
+    t = _re_mod.sub(r'[（(][^）)]*$', '', t)
+    # 8) " by 作者" 英文作者后缀（含 [国籍]，直到行尾 / 括号 / 来源描述）
+    t = _re_mod.sub(r'\s+by\s+[^（）()]*?(?=[（(]|$|\s*[-—–]\s*(?:出版社|出版|引进|出品))', '', t, flags=_re_mod.I)
+    t = _re_mod.sub(r'\s+by\s+.+$', '', t, flags=_re_mod.I)
+    # 9) = 截断取中文主书名（左侧含≥2汉字时）
+    _eq = t.find(' = ')
+    if _eq < 0:
+        _eq = t.find('＝')
+    if _eq >= 0:
+        _left = t[:_eq].strip()
+        if _left and sum(1 for c in _left if '\u4e00' <= c <= '\u9fff') >= 2:
+            t = _left
+    # 10) 删连续≥2个拉丁词的拼音/纯英文噪音块（如 "Wen ge qian de Deng Xiaoping ..."）
+    t = _re_mod.sub(r'(?i)\s*\b[A-Za-z]+(?:[.\-][A-Za-z0-9]+)*\b(?:\s+[A-Za-z]+(?:[.\-][A-Za-z0-9]+)*\b){1,}', '', t)
+    # 11) 文件扩展名
+    t = _re_mod.sub(r'\.(pdf|epub|mobi|azw3?|txt|djvu?|chm|docx?|fb2|rtf|zip|rar|7z)\s*$', '', t, flags=_re_mod.I)
+    # 12) 来源描述： -出版社/引进/出版/译丛/丛书（连同其后非标点残留一并清）
+    t = _re_mod.sub(r'\s*[-—–]\s*.*?(?:出版社|出版公司|引进|出品|出品方|译丛|丛书)[^，。、（）()]*', '', t)
+    # 13) 在首个促销起始词处截断（仅当该词不在标题最开头，避免误切真书名）
+    for _kw in _TITLE_PROMO_CUT:
+        _j = t.find(_kw)
+        if _j > 1:
+            t = t[:_j]
+            break
+    # 14) 收尾：压缩空格、去首尾标点
+    t = _re_mod.sub(r'\s{2,}', ' ', t).strip()
+    t = t.strip(' .,，-—–、:：()（）[]【】=-')
+    if not t:
+        return (title or '').strip()  # 清洗过度则回退原标题
+    return t
+
+
+def _title_query_variants(title):
+    """生成多个检索变体：先 normalize_title 清洗 → 主标题(含汉字最多的空白段) → 去后缀 → 取前N字。
+    subject_suggest 是书名前缀匹配接口，对长书名/丛书后缀极挑剔，多变体逐一尝试可大幅提升命中。"""
+    t = normalize_title(title)
+    if not t:
+        t = (title or '').strip()
+    # 按空白分段后取含汉字最多的段作主书名，避免年代/数字前缀抢首段
+    _segs = [s.strip() for s in _re_mod.split(r'\s+', t)]
+    _segs = [s for s in _segs if s]
+    def _chc(s): return sum(1 for c in s if '\u4e00' <= c <= '\u9fff')
+    _segs_sorted = sorted(_segs, key=_chc, reverse=True)
+    head = _segs_sorted[0] if _segs_sorted else t
+    vs = [t, head]
     t2 = _re_mod.sub(_TITLE_SUFFIX + r'$', '', head).strip()
     if t2 and t2 != head:
         vs.append(t2)
-    for n in (12, 10, 8, 6, 4):
+    for n in (14, 12, 10, 8, 6, 4):
         if len(head) >= n:
             vs.append(head[:n])
     seen = set(); out = []
@@ -1288,17 +1504,27 @@ def _douban_meta(title, author=None, isbn=None):
     hid = best.get("id")
     if not hid:
         return None
+    # 详情页可能超时（豆瓣对本机 IP 限速，book.douban.com 详情页下载极慢），
+    # 先基于 suggest 结果构造兜底（含年份/ISBN），详情页成功则覆盖更全字段。
+    pub = ""
+    yr_text = (best.get("year") or "").strip()
+    isbn_from_sug = best.get("isbn") or ""
+    desc = ""
     try:
-        h = _http_get_text("https://book.douban.com/subject/%s/" % hid, timeout=8)
+        h = _http_get_text("https://book.douban.com/subject/%s/" % hid, timeout=10, max_bytes=250000)
+        pub_m = _re_mod.search(r'出版社:</span>\s*<a[^>]*>([^<]+)</a>', h)
+        pub_m2 = _re_mod.search(r'出版社:</span>\s*([^<\n]+)', h)
+        pub = pub_m.group(1).strip() if pub_m else (pub_m2.group(1).strip() if pub_m2 else "")
+        yr = _re_mod.search(r'出版年:</span>\s*([^<\n]+)', h)
+        if yr:
+            yr_text = yr.group(1).strip()
+        isbn_r = _re_mod.search(r'ISBN:</span>\s*([^<\n]+)', h)
+        if isbn_r:
+            isbn_from_sug = isbn_r.group(1).strip()
+        intro = _re_mod.search(r'<div class="intro">\s*(.*?)</div>', h, _re_mod.S)
+        desc = _re_mod.sub(r'<[^>]+>', '', intro.group(1)).strip() if intro else ""
     except Exception as e:
-        print(f"[豆瓣详情失败] {title[:24]}: {e}", flush=True); return None
-    pub = _re_mod.search(r'出版社:</span>\s*<a[^>]*>([^<]+)</a>', h)
-    pub2 = _re_mod.search(r'出版社:</span>\s*([^<\n]+)', h)
-    pub = pub.group(1).strip() if pub else (pub2.group(1).strip() if pub2 else "")
-    yr = _re_mod.search(r'出版年:</span>\s*([^<\n]+)', h)
-    isbn_r = _re_mod.search(r'ISBN:</span>\s*([^<\n]+)', h)
-    intro = _re_mod.search(r'<div class="intro">\s*(.*?)</div>', h, _re_mod.S)
-    desc = _re_mod.sub(r'<[^>]+>', '', intro.group(1)).strip() if intro else ""
+        print(f"[豆瓣详情失败·用suggest兜底] {title[:24]}: {e}", flush=True)
     is_isbn_hit = bool(isbn and best.get("isbn") and best["isbn"].replace("-", "") == isbn.replace("-", ""))
     bt = best.get("title", "")
     # 信任判定：ISBN 命中 / 变体与返回书名互含 / 高相似度（避免短词模糊错配）
@@ -1306,8 +1532,8 @@ def _douban_meta(title, author=None, isbn=None):
     sim = 1.0 if is_isbn_hit else best_sim
     return {
         "publisher": pub,
-        "publish_date": (yr.group(1).strip() if yr else ""),
-        "isbn": (isbn_r.group(1).strip() if isbn_r else (best.get("isbn") or "")),
+        "publish_date": yr_text,
+        "isbn": isbn_from_sug,
         "language": "zh",
         "description": desc[:2000],
         "source": "douban",
@@ -1316,8 +1542,20 @@ def _douban_meta(title, author=None, isbn=None):
     }
 
 
-def _proxy_handler():
-    """返回 urllib 代理处理器：优先 LIB_PROXY 环境变量，否则读系统/环境代理，皆无则直连。"""
+# 豆瓣为国内站点，强制直连（国际代理会让其失败）；Open Library / Google Books 走代理（如有）。
+_DIRECT_DOMAINS = ("book.douban.com", "douban.com", "localhost", "127.0.0.1")
+
+def _proxy_handler(url=None):
+    """域名分流代理：豆瓣等国内站/本机强制直连；Open Library / Google Books 走 LIB_PROXY 或系统代理（如有），否则直连。
+    修复要点：配置 LIB_PROXY 国际代理时，豆瓣不再被误路由→直连必通；OL/Google 仍走代理以提升英文书覆盖。"""
+    host = ""
+    if url:
+        try:
+            host = (urllib.parse.urlparse(url).hostname or "").lower()
+        except Exception:
+            host = ""
+    if host and any(host == d or host.endswith("." + d) for d in _DIRECT_DOMAINS):
+        return urllib.request.ProxyHandler({})  # 直连，绕开任何代理
     p = os.environ.get("LIB_PROXY")
     if p:
         return urllib.request.ProxyHandler({"http": p, "https": p})
@@ -1327,57 +1565,64 @@ def _proxy_handler():
 def _http_get_json(url, timeout=5):
     """标准库 urllib 发 GET，自动读取 HTTP_PROXY/HTTPS_PROXY 环境变量（复用 git 代理）。失败抛出异常（由调用方按场景处理）。"""
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (PrivateLib)"})
-    proxy = _proxy_handler()
+    proxy = _proxy_handler(url)
     opener = urllib.request.build_opener(proxy)
     with opener.open(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8", "ignore"))
 
 _google_cooldown_until = 0.0  # Google Books 命中 429 后的冷却时间戳，避免共享 IP 连环限流
 
-def fetch_online_metadata(title, author=None, isbn=None):
-    """在线补全单本书元数据（Open Library 优先 + Google Books 兜底，均无需 key）。
+def fetch_online_metadata(title, author=None, isbn=None, normalized_title=None):
+    """在线补全单本书元数据（豆瓣优先 + Open Library/Google Books 兜底，均无需 key）。
     返回 dict: {publisher,publish_date,isbn,language,description,source,sim} 或 None。
     仅用于填空字段；sim 为书名相似度，ISBN 命中时置 1.0。
-    说明：免费 API 对中文书覆盖有限；Google Books 共享 IP 易 429，已加冷却与超时保护。"""
+    说明：优先用已清洗的 normalized_title 作为检索查询（与预览一致、避免重复清洗）；
+    未配置 LIB_PROXY 国际代理时，Open Library/Google Books 在国内直连必超时，故跳过它们，
+    Douban 中文书直连即可，大幅提升批量速度。"""
     global _google_cooldown_until
     if not ENABLE_ONLINE_METADATA:
         return None
-    title = (title or "").strip()
-    if not title and not isbn:
+    # 优先用已清洗的 normalized_title 作为检索查询
+    q = (normalized_title or "").strip() or (title or "").strip()
+    if not q and not isbn:
         return None
     result = None
     best_sim = 0.0
     # 0) 豆瓣（中文书最高优先级；覆盖出版社/出版年/ISBN/简介，命中率高）
     try:
-        dm = _douban_meta(title, author, isbn)
+        dm = _douban_meta(q, author, isbn)
         if dm and dm.get("sim", 0) >= 0.5:
             result = dm
     except Exception as e:
-        print(f"[豆瓣失败] {title[:30]}: {e}", flush=True)
-    # 1) Open Library（英文/知名书补充源；拉长超时应对国内网络抖动）
+        print(f"[豆瓣失败] {q[:30]}: {e}", flush=True)
+    # 1) Open Library（英文/知名书补充源；仅在配置了 LIB_PROXY 国际代理时尝试，否则国内直连必超时）
+    _have_proxy = bool(os.environ.get("LIB_PROXY"))
     try:
         ol = None
-        if isbn:
-            ol = _http_get_json("https://openlibrary.org/isbn/%s.json?jscmd=details&format=json" % isbn.replace("-",""), timeout=5)
-            best_sim = 1.0
-        if not ol and title:
-            s = _http_get_json("https://openlibrary.org/search.json?title=" + urllib.parse.quote(title)
-                               + ("&author=" + urllib.parse.quote(author) if author else "") + "&limit=5", timeout=5)
-            docs = (s or {}).get("docs", [])
-            if docs:
-                best = None; bs = 0.0
-                for d in docs:
-                    sm = _sim(title, d.get("title",""))
-                    if sm > bs: bs = sm; best = d
-                best_sim = bs
-                if best:
-                    ol = best
-                    if str(best.get("key","")).startswith("/works/"):
-                        wk = _http_get_json("https://openlibrary.org" + best["key"] + ".json", timeout=5)
-                        if wk and isinstance(wk.get("description"), str):
-                            ol = dict(ol); ol["_desc"] = wk["description"]
-                        elif wk and isinstance(wk.get("description"), dict):
-                            ol = dict(ol); ol["_desc"] = wk["description"].get("value","")
+        if _have_proxy:
+            if isbn:
+                ol = _http_get_json("https://openlibrary.org/isbn/%s.json?jscmd=details&format=json" % isbn.replace("-",""), timeout=5)
+                best_sim = 1.0
+            if not ol and q:
+                s = _http_get_json("https://openlibrary.org/search.json?title=" + urllib.parse.quote(q)
+                                   + ("&author=" + urllib.parse.quote(author) if author else "") + "&limit=5", timeout=5)
+                docs = (s or {}).get("docs", [])
+                if docs:
+                    best = None; bs = 0.0
+                    for d in docs:
+                        sm = _sim(q, d.get("title",""))
+                        if sm > bs: bs = sm; best = d
+                    best_sim = bs
+                    if best:
+                        ol = best
+                        if str(best.get("key","")).startswith("/works/"):
+                            wk = _http_get_json("https://openlibrary.org" + best["key"] + ".json", timeout=5)
+                            if wk and isinstance(wk.get("description"), str):
+                                ol = dict(ol); ol["_desc"] = wk["description"]
+                            elif wk and isinstance(wk.get("description"), dict):
+                                ol = dict(ol); ol["_desc"] = wk["description"].get("value","")
+        else:
+            print(f"[OL跳过] 未配置 LIB_PROXY，跳过 Open Library（国内直连超时）: {q[:24]}", flush=True)
         if ol:
             pub = ol.get("publishers")
             pub = pub[0] if isinstance(pub, list) and pub else ""
@@ -1402,17 +1647,17 @@ def fetch_online_metadata(title, author=None, isbn=None):
                 if best_sim > result.get("sim", 0): result["sim"] = best_sim
     except Exception as e:
         print(f"[OL失败] {title[:30]}: {e}", flush=True)
-    # 2) Google Books 兜底（仅在 OL 无描述 且 未处于 429 冷却时调用，避免共享 IP 被限流）
+    # 2) Google Books 兜底（仅在配置了 LIB_PROXY 时调用；未配置代理则直连超时，直接跳过）
     try:
-        need_google = (not result) or (not result.get("description")) or (title and best_sim < 0.7)
-        if need_google and time.time() > _google_cooldown_until:
-            gq = title + (" " + author if author else "")
+        need_google = (not result) or (not result.get("description")) or (q and best_sim < 0.7)
+        if _have_proxy and need_google and time.time() > _google_cooldown_until:
+            gq = q + (" " + author if author else "")
             g = _http_get_json("https://www.googleapis.com/books/v1/volumes?q=" + urllib.parse.quote(gq) + "&maxResults=5", timeout=5)
             items = (g or {}).get("items", [])
             if items:
                 vi = items[0].get("volumeInfo", {})
                 gdesc = vi.get("description","")
-                gsim = _sim(title, vi.get("title",""))
+                gsim = _sim(q, vi.get("title",""))
                 if (not result) or (gdesc and not result.get("description")) or (gsim > result.get("sim",0)):
                     merged = dict(result) if result else {}
                     gis = ""; ids = vi.get("industryIdentifiers", [])
@@ -1438,12 +1683,12 @@ def fetch_online_metadata(title, author=None, isbn=None):
             print(f"[GB失败] {title[:30]}: {e}", flush=True)
     return result
 
-def _fetch_meta_timeout(title, author, isbn, timeout=15):
+def _fetch_meta_timeout(title, author, isbn, normalized_title=None, timeout=15):
     """在独立线程里跑 fetch_online_metadata，硬性超时返回 None，避免外部 API 挂死拖垮整批。"""
     box = {}
     def _run():
         try:
-            box['v'] = fetch_online_metadata(title, author, isbn)
+            box['v'] = fetch_online_metadata(title, author, isbn, normalized_title=normalized_title)
         except Exception as e:
             print(f"[元数据线程异常] {title[:24]}: {type(e).__name__}: {e}", flush=True)
             box['v'] = None
@@ -1477,7 +1722,7 @@ def run_metadata_async(count=None):
             rv = {"done":0,"total":len(books),"filled":0,"skipped":0}
             for b in books:
                 try:
-                    meta = _fetch_meta_timeout(b['title'], b.get('author'), b.get('isbn'))
+                    meta = _fetch_meta_timeout(b['title'], b.get('author'), b.get('isbn'), normalized_title=b.get('normalized_title'))
                     if meta:
                         sim = meta.get("sim", 0)
                         isbn_match = bool(b.get('isbn')) and meta.get("isbn") and b['isbn'].replace("-","")==meta["isbn"].replace("-","")
@@ -1499,11 +1744,11 @@ def run_metadata_async(count=None):
                             print(f"[元数据低置信跳过] {b['title'][:30]}: sim={sim:.2f}", flush=True)
                     else:
                         rv["skipped"] += 1
-                    rv["done"] += 1; _task_status['mr_r'] = rv
-                    time.sleep(1.2)
+                    rv["done"] += 1; _task_status['mr_r'] = rv; _mark('metadata', b['id'], 'done')
+                    time.sleep(0.6)
                 except Exception as e:
                     print(f"[元数据异常] {b['title'][:30]}: {type(e).__name__}: {e}", flush=True)
-                    rv["done"] += 1; _task_status['mr_r'] = rv
+                    rv["done"] += 1; _task_status['mr_r'] = rv; _mark('metadata', b['id'], 'skip')
             _task_status['mr_r'] = rv
         finally:
             _task_status['mr'] = False
@@ -1629,6 +1874,7 @@ def run_transcribe_async(count=10, media_type="all"):
                     except: pass
                     rv["done"] += 1; rv["error_count"] += 1
                     _task_status['tr_r'] = rv
+            _mark('transcribe', m['id'], 'done')
             _task_status['tr_r'] = rv
         
         finally:
@@ -1673,6 +1919,7 @@ def run_media_summarize_async(count=10):
                         dbe("UPDATE media SET summary=?, summary_model='error', summary_updated=datetime('now') WHERE id=?", (f"[摘要失败: {str(e)[:200]}]", m['id']))
                     except: pass
                     rv["done"] += 1; rv["error_count"] += 1
+            _mark('media_summarize', m['id'], 'done')
             _task_status['ms_r'] = rv
        
 
@@ -1817,6 +2064,7 @@ class H(http.server.SimpleHTTPRequestHandler):
             if path == "/api/media/transcribe": self.json(run_transcribe_async(data.get('count',10), data.get('media_type','all'))); return
             if path == "/api/media/summarize": self.json(run_media_summarize_async(data.get('count',10))); return
             if path == "/api/media/transcribe-one": self.json(run_transcribe_one_async(data.get('media_id',''))); return
+            if path == "/api/tools/run": self.json(_tool_run(data)); return
             if path.startswith("/api/media/") and path.endswith("/edit"):
                 mid=path.split("/")[3]; title=data.get('title','').strip()
                 if title: dbe("UPDATE media SET title=?, updated_at=datetime('now') WHERE id=?",(title,mid)); self.json({"ok":True,"title":title})
@@ -1950,6 +2198,7 @@ class H(http.server.SimpleHTTPRequestHandler):
         p=urllib.parse.urlparse(self.path); path=p.path; qs=urllib.parse.parse_qs(p.query)
         try:
             if path=="/api/health": self.json({"status":"ok"})
+            elif path=="/api/tools/status": self.json(_tool_status())
             elif path=="/api/task-status": self.json({"classify":_task_status.get('cr_r',{}),"summarize":_task_status.get('sr_r',{}),"extract":_task_status.get('er_r',{}),"transcribe":_task_status.get('tr_r',{}),"media_summarize":_task_status.get('ms_r',{}),"scan_import":_task_status.get('ir_r',{}),"metadata":_task_status.get('mr_r',{})})
             elif path.startswith("/api/books/") and path.endswith("/notes"):
                 bid=path.split("/")[3]
@@ -2547,6 +2796,18 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             h+='<input type=text id=scanDir placeholder="例如: G:\\书籍\\待分类2" style="width:70%;padding:8px 12px;border:1px solid #ddd;border-radius:4px;font-size:14px"> '
             h+='<button class=btn onclick="SCAN()" style="background:#722ed1">🔍 开始扫描导入</button>'
             h+='<div id=scanRes style=margin-top:8px;font-size:13px></div></div>'
+        elif pn=='tools':
+            h+='<h2>🛠️ 工具中心</h2>'
+            h+='<div class=panel><h3>📦 离线工具（tools/，可续跑 · 不依赖盘符）</h3>'
+            h+='<p class=co>独立于主服务运行，进度存 progress.db，停了不白跑。点「运行」即后台启动；也可直接双击 tools/run_*.bat。需 Ollama 的工具（摘要修复）请确认本机 Ollama 已启动。</p>'
+            h+='<div style="margin:10px 0"><b>① 知识图谱 L1</b>（结构层，不需 Ollama）<br>数量<input id=kgLimit value=300 style="width:70px;margin:0 6px"><button class=btn onclick="TR(\'kg\',false)">▶ 生成</button> <button class=btn onclick="TR(\'kg\',true)">🔄 清空重跑</button> <span id=kgRes></span></div>'
+            h+='<div style="margin:10px 0"><b>② 元数据补全</b>（豆瓣，可续跑）<br>模式<select id=metaMode><option value=fast>fast 铺年份/ISBN</option><option value=full>full 补出版社/简介</option></select> 数量<input id=metaLimit value=200 style="width:70px;margin:0 6px"><button class=btn onclick="TR(\'meta\',false)">▶ 跑一批</button> <button class=btn onclick="TR(\'meta\',true)">🔁 重试失败</button> <span id=metaRes></span></div>'
+            h+='<div style="margin:10px 0"><b>③ 摘要修复</b>（清假摘要+重跑，需 Ollama）<br>数量<input id=sumLimit value=50 style="width:70px;margin:0 6px"><button class=btn onclick="TR(\'summary\',false)">▶ 修复</button> <span id=sumRes></span></div>'
+            h+='<div style="margin-top:10px"><button class=btn onclick="TP()">🔄 刷新进度</button> <span id=toolStat style="font-size:13px;color:#666"></span></div>'
+            h+='<div id=toolLog style="margin-top:8px;font-size:12px;color:#666;white-space:pre-wrap"></div></div>'
+            h+='<div class=panel><h3>⚡ 在服工具（首页 AI 面板直接触发）</h3>'
+            h+='<p class=co>AI 分类 / 提取文本 / AI 摘要 / 补全元数据 / 媒体转录 / 转录→摘要 —— 见 <a href="/">首页「AI 处理」面板</a>。均已接入续跑进度。</p></div>'
+            h+="<script>function TR(t,re){var lim=(t=='kg'?document.getElementById('kgLimit').value:(t=='meta'?document.getElementById('metaLimit').value:document.getElementById('sumLimit').value));var md=(t=='meta'?document.getElementById('metaMode').value:'');var b=JSON.stringify({tool:t,limit:lim,mode:md,regen:!!re});var x=new XMLHttpRequest();x.open('POST','/api/tools/run');x.setRequestHeader('Content-Type','application/json');x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById(t+'Res').textContent=r.msg||(r.ok?'已启动':'失败');TP();}catch(e){document.getElementById(t+'Res').textContent='error'}};x.send(b);}function TP(){var x=new XMLHttpRequest();x.open('GET','/api/tools/status');x.onload=function(){try{var r=JSON.parse(x.responseText);var s='';for(var k in r){if(k=='_error'){s+='读取错误:'+r[k];continue;}var v=r[k];s+=k+': 完成'+v.done+' 跳过'+v.skip+(v.running?' [运行中]':'')+'  ';}document.getElementById('toolStat').textContent=s;}catch(e){}};x.send();}TP();</script>"
         else:
             ts=ct.get('ts',0); import_rem=ct.get('import_rem',0); sum_rem=ct.get('sum_rem',0); no_text=ct.get('no_text',0)
             _ld=""

@@ -43,7 +43,7 @@ desktop.ini
 
 # === 二进制工具 ===
 SumatraPDF/
-tools/
+tools/ffmpeg/
 pdfjs/
 
 # === WorkBuddy 内部 ===
