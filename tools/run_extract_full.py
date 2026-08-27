@@ -9,9 +9,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import Private_Lib as P
 
 DB = r"F:/my-library/data/library.db"
-LOG = r"F:/my-library/tools/_extract_run.log"
 WORKERS = 4
 PER_BOOK_TIMEOUT = 60
+# ocr 模式用独立日志，避免与全量抽取日志混写导致进度误读
+_MODE = sys.argv[1] if len(sys.argv) > 1 else ""
+LOG = r"F:/my-library/tools/_ocr_run.log" if _MODE == "ocr" else r"F:/my-library/tools/_extract_run.log"
 
 logf = open(LOG, "a", encoding="utf-8")
 def L(*a):
@@ -44,14 +46,16 @@ def main():
                WHERE b.status='active' AND b.text_extracted<>1"""
     rows = con.execute(q).fetchall()
     con.close()
-    L(f"[start] candidates={len(rows)} workers={WORKERS} timeout={PER_BOOK_TIMEOUT}s")
+    workers = 2 if mode == "ocr" else WORKERS
+    timeout = 180 if mode == "ocr" else PER_BOOK_TIMEOUT
+    L(f"[start] candidates={len(rows)} mode={mode} workers={workers} timeout={timeout}s")
     done = extracted = skipped = 0
     t0 = time.time()
-    with cf.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(work, r[0], r[1], r[2]): r for r in rows}
         for fut in cf.as_completed(futs):
             try:
-                bid, ok, err = fut.result(timeout=PER_BOOK_TIMEOUT)
+                bid, ok, err = fut.result(timeout=timeout)
             except cf.TimeoutError:
                 bid = futs[fut][0]
                 skipped += 1; done += 1

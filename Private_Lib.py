@@ -179,6 +179,7 @@ def _lib_stats():
         "isbn": _c("SELECT COUNT(*) c FROM books WHERE status='active' AND isbn IS NOT NULL AND isbn<>''"),
         "language": _c("SELECT COUNT(*) c FROM books WHERE status='active' AND language IS NOT NULL AND language<>''"),
         "text_extracted": _c("SELECT COUNT(*) c FROM books WHERE status='active' AND text_extracted=1"),
+        "ocr_pending": _c("SELECT COUNT(*) c FROM books b JOIN book_text bt ON bt.id=b.id WHERE b.file_format='pdf' AND b.text_extracted=1 AND length(bt.text_content)<=200"),
         "named": _c("SELECT COUNT(*) c FROM books WHERE status='active' AND normalized_title IS NOT NULL AND normalized_title<>'' AND normalized_title NOT LIKE 'upload_%'"),
     }
     fake = 0
@@ -226,6 +227,12 @@ def _tool_center_html():
         '%d / %d 本 (%.1f%%)' % (ext_n, total, pct(ext_n)), ext_n, '#52c41a',
         '/?p=stats', '查看全文提取覆盖率',
         '<button class=btn onclick="EXTR()">▶ 全量抽取(续跑)</button> <span id=extRes></span>')
+    ocr_n = cov.get('ocr_pending',0)
+    h += card('📷','扫描版OCR',
+        '对「已抽但正文极短(疑似书名兜底)」的扫描版PDF，用本机 tesseract+chi_sim 重新OCR识别，解锁无文字层书籍的正文。需本机已装 tesseract（tools/install_tesseract.bat）。',
+        '待OCR重抽 %d 本' % ocr_n, max(0, ocr_n), '#eb2f96',
+        '/?p=stats', '查看全文提取覆盖率',
+        '<button class=btn onclick="EXTR_OCR()">▶ OCR 重抽扫描版</button> <span id=ocrRes></span>')
     nm_n = cov.get('named',0)
     h += card('📐','书名规则化',
         '套用 normalize_title() 清洗镜像站点标记/随机ID/作者括号/促销词/扩展名，展示「原书名→规则化」对比，可勾选采纳为正式书名。',
@@ -267,6 +274,10 @@ def _tool_center_html():
 function EXTR(){var x=new XMLHttpRequest();x.open("POST","/api/extract-batch");x.setRequestHeader("Content-Type","application/json");
 x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById("extRes").textContent=r.status||(r.ok?"已启动":"失败");TP();}catch(e){document.getElementById("extRes").textContent="error"}};
 x.send(JSON.stringify({count:20000}));}
+function EXTR_OCR(){var x=new XMLHttpRequest();x.open("POST","/api/extract-ocr");x.setRequestHeader("Content-Type","application/json");
+x.onload=function(){try{var r=JSON.parse(x.responseText);if(r.status=="no_tesseract"){document.getElementById("ocrRes").textContent="⚠️ 未装tesseract，先跑 install_tesseract.bat";return;}document.getElementById("ocrRes").textContent=r.status||"已启动";OCRPOLL();}catch(e){document.getElementById("ocrRes").textContent="error"}};
+x.send(JSON.stringify({}));}
+function OCRPOLL(){var x=new XMLHttpRequest();x.open("GET","/api/extract-ocr/status");x.onload=function(){try{var r=JSON.parse(x.responseText);var s=(r.running?"OCR中 "+r.done+"/"+r.total:"完成 "+r.done+"/"+r.total);document.getElementById("ocrRes").textContent=s;if(r.running)setTimeout(OCRPOLL,2000)}catch(e){}};x.send();}
 function TNREC(){var x=new XMLHttpRequest();x.open("POST","/api/title-norm/recompute");x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById("tnRes").textContent=r.msg||(r.ok?"已启动":"失败");if(r.ok)TNPOLL()}catch(e){document.getElementById("tnRes").textContent="error"}};x.send();}
 function TNPOLL(){var x=new XMLHttpRequest();x.open("GET","/api/title-norm/recompute-status");x.onload=function(){try{var r=JSON.parse(x.responseText);var s=(r.running?"重算中 "+r.done+"/"+r.total:"完成 "+r.done+"/"+r.total)+(r.error?" 错误:"+r.error:"");document.getElementById("tnRes").textContent=s;if(r.running)setTimeout(TNPOLL,1500)}catch(e){}};x.send();}
 function TR(t,re,lf){var lim=lf||(t=='kg'?document.getElementById('kgLimit').value:(t=='meta'?document.getElementById('metaLimit').value:document.getElementById('sumLimit').value));
@@ -1365,6 +1376,46 @@ def run_extract_async(count=10):
     threading.Thread(target=w,daemon=True).start()
     return {"status":"started"}
 
+def run_extract_ocr_async():
+    """扫描版OCR重抽：后台 spawn tools/run_extract_full.py ocr（多线程、可续跑），并轮询其独立日志(_ocr_run.log)上报进度。需本机已装 tesseract。"""
+    if _task_status.get('eor'): return {"status":"running"}
+    if not shutil.which("tesseract") and not shutil.which("tesseract.exe"):
+        return {"status":"no_tesseract", "msg":"本机未安装 tesseract，请先运行 tools/install_tesseract.bat"}
+    _task_status['eor'] = True
+    _task_status['eor_r'] = {"done":0,"total":0,"running":True}
+    def w():
+        try:
+            import subprocess, os, time, re
+            py = sys.executable
+            base = os.path.dirname(os.path.abspath(__file__))
+            script = os.path.join(base, "tools", "run_extract_full.py")
+            logp = os.path.join(base, "tools", "_ocr_run.log")
+            # 0x00000008 = DETACHED_PROCESS：脱离服务进程独立运行，崩溃不影响在服
+            proc = subprocess.Popen([py, script, "ocr"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    creationflags=0x00000008)
+            while True:
+                if proc.poll() is not None: break
+                try:
+                    with open(logp, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = f.read().splitlines()
+                    for ln in reversed(lines):
+                        if "[prog] done=" in ln or "[done] total=" in ln or "[start] candidates=" in ln:
+                            m = re.search(r"candidates=(\d+)", ln) or re.search(r"done=(\d+)/(\d+)", ln)
+                            if m:
+                                if "candidates" in ln: _task_status['eor_r']["total"] = int(m.group(1))
+                                else: _task_status['eor_r']["done"] = int(m.group(1)); _task_status['eor_r']["total"] = int(m.group(2))
+                            break
+                except Exception: pass
+                time.sleep(3)
+            _task_status['eor_r']["running"] = False
+            _task_status['eor_r']["done"] = _task_status['eor_r'].get("total", 0)
+        finally:
+            _task_status['eor'] = False
+            _count_cache["time"] = 0  # 失效缓存，让覆盖率刷新
+    threading.Thread(target=w, daemon=True).start()
+    return {"status":"started"}
+
 def _get_taxonomy():
     """从 categories 表构建 一级->[二级] 映射"""
     try:
@@ -2260,6 +2311,8 @@ class H(http.server.SimpleHTTPRequestHandler):
             if path == "/api/summarize-batch": self.json(run_summarize_async(data.get('count',3))); return
             if path == "/api/metadata-batch": self.json(run_metadata_async(data.get('count') or None)); return
             if path == "/api/extract-batch": self.json(run_extract_async(data.get('count',10))); return
+            if path == "/api/extract-ocr": self.json(run_extract_ocr_async()); return
+            if path == "/api/extract-ocr/status": self.json(_task_status.get('eor_r', {"running":False,"done":0,"total":0})); return
             # 媒体转录/摘要 20260801
             if path == "/api/media/transcribe": self.json(run_transcribe_async(data.get('count',10), data.get('media_type','all'))); return
             if path == "/api/media/summarize": self.json(run_media_summarize_async(data.get('count',10))); return
