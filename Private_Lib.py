@@ -181,7 +181,11 @@ def _lib_stats():
         "text_extracted": _c("SELECT COUNT(*) c FROM books WHERE status='active' AND text_extracted=1"),
         "named": _c("SELECT COUNT(*) c FROM books WHERE status='active' AND normalized_title IS NOT NULL AND normalized_title<>'' AND normalized_title NOT LIKE 'upload_%'"),
     }
-    return {"total_books": total, "total_media": total_media, "coverage": cov, "tools": _tool_status()}
+    fake = 0
+    for r in dbq("SELECT summary FROM books WHERE status='active' AND summary IS NOT NULL AND summary<>''"):
+        if _is_fake_summary(r['summary']):
+            fake += 1
+    return {"total_books": total, "total_media": total_media, "coverage": cov, "fake_summary": fake, "tools": _tool_status()}
 
 def migrate_schema():
     """P0：阅读进度(reading_status/last_page) + 智能书架(shelves)。幂等，可在启动时安全重复调用。"""
@@ -1502,6 +1506,49 @@ def _title_norm_recompute_status():
     return dict(_tn_rec)
 
 
+# —— 假摘要识别（与 tools/summary_fix.py 同源，供工具中心/统计页展示待修数）——
+_FAKE_START = ("由于", "抱歉", "（以下", "(以下", "您好", "你好", "（注", "注：",
+               "根据您", "根据提供", "我将")
+_FAKE_MID = ("内容为空白", "提供的内容为空", "提供的内容为空白", "内容为空", "内容有限",
+             "内容未知", "未提供", "无法获取", "无法访问", "空白", "占位", "示例摘要",
+             "示例文本", "我将根据", "假设的内容", "虚构的内容", "假设性的框架",
+             "假设一个虚构", "根据一般图书摘要", "根据常见图书摘要", "帮助您理解如何生成",
+             "假设示例", "示例书籍摘要", "未知的书籍")
+_FAKE_EXACT = ("由于提供的内容为空白", "由于提供的书籍内容为空白",
+               "根据模板结构给出一个示例", "我将根据虚构的内容来生成",
+               "基于一个假设的框架来生成摘要", "根据一般图书摘要的结构给出一个示例",
+               "由于提供的书籍内容为空，我将基于一个假设的示例")
+
+
+def _is_fake_summary(s):
+    if not s:
+        return False
+    s = s.strip()
+    if len(s) < 8:
+        return False
+    if s.startswith(_FAKE_START) and any(m in s[:160] for m in _FAKE_MID):
+        return True
+    if any(m in s for m in _FAKE_EXACT):
+        return True
+    return False
+
+
+def _summary_fix_pending():
+    """统计待修复的假摘要/短摘要数（供工具中心与统计页展示）。"""
+    n = 0; has_text = 0; no_text = 0
+    rows = dbq("SELECT id,summary FROM books WHERE LENGTH(COALESCE(summary,''))>0")
+    for r in rows:
+        if not _is_fake_summary(r['summary']):
+            continue
+        n += 1
+        t = dbq("SELECT text_content FROM book_text WHERE id=?", [r['id']])
+        if t and t[0]['text_content'] and len(t[0]['text_content'].strip()) >= 50:
+            has_text += 1
+        else:
+            no_text += 1
+    return {"pending": n, "has_text": has_text, "no_text": no_text}
+
+
 def _title_query_variants(title):
     """生成多个检索变体：先 normalize_title 清洗 → 主标题(含汉字最多的空白段) → 去后缀 → 取前N字。
     subject_suggest 是书名前缀匹配接口，对长书名/丛书后缀极挑剔，多变体逐一尝试可大幅提升命中。"""
@@ -2279,6 +2326,7 @@ class H(http.server.SimpleHTTPRequestHandler):
             elif path=="/api/task-status": self.json({"classify":_task_status.get('cr_r',{}),"summarize":_task_status.get('sr_r',{}),"extract":_task_status.get('er_r',{}),"transcribe":_task_status.get('tr_r',{}),"media_summarize":_task_status.get('ms_r',{}),"scan_import":_task_status.get('ir_r',{}),"metadata":_task_status.get('mr_r',{})})
             elif path=="/api/title-norm/recompute-status": self.json(_title_norm_recompute_status()); return
             elif path=="/api/stats": self.json(_lib_stats()); return
+            elif path=="/api/summary-fix/pending": self.json(_summary_fix_pending()); return
             elif path.startswith("/api/books/") and path.endswith("/notes"):
                 bid=path.split("/")[3]
                 rows=dbq("SELECT id,note,page,created_at FROM reading_notes WHERE book_id=? ORDER BY created_at DESC",(bid,))
@@ -2880,8 +2928,8 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             h+='<div class=panel><h3>📦 离线工具（tools/，可续跑 · 不依赖盘符）</h3>'
             h+='<p class=co>独立于主服务运行，进度存 progress.db，停了不白跑。点「运行」即后台启动；也可直接双击 tools/run_*.bat。需 Ollama 的工具（摘要修复）请确认本机 Ollama 已启动。</p>'
             h+='<div style="margin:10px 0"><b>① 知识图谱 L1</b>（结构层，不需 Ollama）<br>数量<input id=kgLimit value=300 style="width:70px;margin:0 6px"><button class=btn onclick="TR(\'kg\',false)">▶ 生成</button> <button class=btn onclick="TR(\'kg\',true)">🔄 清空重跑</button> <span id=kgRes></span></div>'
-            h+='<div style="margin:10px 0"><b>② 元数据补全</b>（豆瓣，可续跑）<br>模式<select id=metaMode><option value=fast>fast 铺年份/ISBN</option><option value=full>full 补出版社/简介</option></select> 数量<input id=metaLimit value=200 style="width:70px;margin:0 6px"><button class=btn onclick="TR(\'meta\',false)">▶ 跑一批</button> <button class=btn onclick="TR(\'meta\',true)">🔁 重试失败</button> <span id=metaRes></span></div>'
-            h+='<div style="margin:10px 0"><b>③ 摘要修复</b>（清假摘要+重跑，需 Ollama）<br>数量<input id=sumLimit value=50 style="width:70px;margin:0 6px"><button class=btn onclick="TR(\'summary\',false)">▶ 修复</button> <span id=sumRes></span></div>'
+            h+='<div style="margin:10px 0"><b>② 元数据补全</b>（Open Library 主源，直连无需代理；Google Books 补充）<br>模式<select id=metaMode><option value=fast>fast 铺年份/ISBN/出版社</option><option value=full>full 补出版社/简介</option></select> 数量<input id=metaLimit value=200 style="width:70px;margin:0 6px"><button class=btn onclick="TR(\'meta\',false)">▶ 跑一批</button> <button class=btn onclick="TR(\'meta\',true)">🔁 重试失败</button> <span id=metaRes></span></div>'
+            h+='<div style="margin:10px 0"><b>③ 摘要修复</b>（清假摘要+重跑真摘要，需本机 Ollama 在线）<br><span id=sumPending style="color:#c0392b;font-size:13px"></span><br>数量<input id=sumLimit value=20000 style="width:80px;margin:0 6px"><button class=btn onclick="TR(\'summary\',false)">▶ 跑一批</button> <button class=btn onclick="TR(\'summary\',false,20000)">🔥 全量修复</button> <span id=sumRes></span></div>'
             h+='<div style="margin-top:10px"><button class=btn onclick="TP()">🔄 刷新进度</button> <span id=toolStat style="font-size:13px;color:#666"></span></div>'
             h+='<div id=toolLog style="margin-top:8px;font-size:12px;color:#666;white-space:pre-wrap"></div></div>'
             h+='<div class=panel><h3>📐 书名规则化（展示清洗成果 + 修正漂移）</h3>'
@@ -2890,12 +2938,13 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             h+='<script>function TNREC(){var x=new XMLHttpRequest();x.open("POST","/api/title-norm/recompute");x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById("tnRes").textContent=r.msg||(r.ok?"已启动":"失败");if(r.ok)TNPOLL()}catch(e){document.getElementById("tnRes").textContent="error"}};x.send();}function TNPOLL(){var x=new XMLHttpRequest();x.open("GET","/api/title-norm/recompute-status");x.onload=function(){try{var r=JSON.parse(x.responseText);var s=(r.running?"重算中 "+r.done+"/"+r.total:"完成 "+r.done+"/"+r.total)+(r.error?" 错误:"+r.error:"");document.getElementById("tnRes").textContent=s;if(r.running)setTimeout(TNPOLL,1500)}catch(e){}};x.send();}</script>'
             h+='<div class=panel><h3>⚡ 在服工具（首页 AI 面板直接触发）</h3>'
             h+='<p class=co>AI 分类 / 提取文本 / AI 摘要 / 补全元数据 / 媒体转录 / 转录→摘要 —— 见 <a href="/">首页「AI 处理」面板</a>。均已接入续跑进度。</p></div>'
-            h+="<script>function TR(t,re){var lim=(t=='kg'?document.getElementById('kgLimit').value:(t=='meta'?document.getElementById('metaLimit').value:document.getElementById('sumLimit').value));var md=(t=='meta'?document.getElementById('metaMode').value:'');var b=JSON.stringify({tool:t,limit:lim,mode:md,regen:!!re});var x=new XMLHttpRequest();x.open('POST','/api/tools/run');x.setRequestHeader('Content-Type','application/json');x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById(t+'Res').textContent=r.msg||(r.ok?'已启动':'失败');TP();}catch(e){document.getElementById(t+'Res').textContent='error'}};x.send(b);}function TP(){var x=new XMLHttpRequest();x.open('GET','/api/tools/status');x.onload=function(){try{var r=JSON.parse(x.responseText);var s='';for(var k in r){if(k=='_error'){s+='读取错误:'+r[k];continue;}var v=r[k];s+=k+': 完成'+v.done+' 跳过'+v.skip+(v.running?' [运行中]':'')+'  ';}document.getElementById('toolStat').textContent=s;}catch(e){}};x.send();}TP();</script>"
+            h+="<script>function TR(t,re,lf){var lim=lf||(t=='kg'?document.getElementById('kgLimit').value:(t=='meta'?document.getElementById('metaLimit').value:document.getElementById('sumLimit').value));var md=(t=='meta'?document.getElementById('metaMode').value:'');var b=JSON.stringify({tool:t,limit:lim,mode:md,regen:!!re});var x=new XMLHttpRequest();x.open('POST','/api/tools/run');x.setRequestHeader('Content-Type','application/json');x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById(t+'Res').textContent=r.msg||(r.ok?'已启动':'失败');TP();}catch(e){document.getElementById(t+'Res').textContent='error'}};x.send(b);}function TP(){var x=new XMLHttpRequest();x.open('GET','/api/tools/status');x.onload=function(){try{var r=JSON.parse(x.responseText);var s='';for(var k in r){if(k=='_error'){s+='读取错误:'+r[k];continue;}var v=r[k];s+=k+': 完成'+v.done+' 跳过'+v.skip+(v.running?' [运行中]':'')+'  ';}document.getElementById('toolStat').textContent=s;}catch(e){}};x.send();}function SP(){var x=new XMLHttpRequest();x.open('GET','/api/summary-fix/pending');x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById('sumPending').textContent='待修假摘要 '+r.pending+' 本（有全文可重跑 '+r.has_text+' · 无全文将清空 '+r.no_text+'）';}catch(e){}};x.send();}TP();SP();</script>"
         elif pn=='stats':
             st = _lib_stats()
             total = st['total_books']; tm = st['total_media']
             cov = st['coverage']
             h+='<h2>📊 图书馆统计</h2>'
+            h+='<div class=panel><h3>🧹 摘要健康</h3><p class=co>当前仍有 <b style="color:#c0392b">'+str(st.get('fake_summary',0))+'</b> 本<b>假摘要</b>（导入时无正文被 LLM 编的模板示例，典型首句「由于提供的内容为空白…」）。其中<b>无全文</b>的将清空、<b>有全文</b>的可经本机 Ollama 重跑真摘要。处理方式：工具中心「③ 摘要修复」→「🔥 全量修复」（需 Ollama 在线）。</p></div>'
             h+='<div class=panel><h3>📦 规模</h3><div class=row>'
             h+='<a class=sb><div class=n style=color:#1677ff>'+str(total)+'</div><div class=l>📚 书籍</div></a>'
             h+='<a class=sb><div class=n style=color:#fa8c16>'+str(tm)+'</div><div class=l>🎧 媒体</div></a></div></div>'

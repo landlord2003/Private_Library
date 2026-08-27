@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 # meta_complete.py — 离线可续跑元数据补全
 # 不依赖主服务，直连 library.db；进度存 progress.db（skip/done/partial），停了不白跑。
-# 快模式(fast)：仅豆瓣 suggest，填 年份+ISBN（快，适合平时有空跑一点）。
-# 全模式(full)：加详情页，补 出版社+简介（慢，按需）。
+# 数据源：Open Library（主源，直连无需代理） + Google Books（补充） + 豆瓣（仅 LIB_PROXY 配置时兜底）。
+# 快模式(fast)：仅标题检索填 年份+ISBN+出版社（快）。全模式(full)：加 works/editions 详情补简介（慢，按需）。
 import os
 import sys
 import time
