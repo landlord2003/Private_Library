@@ -26,11 +26,22 @@ def work(bid, fpath, ff):
         return (bid, False, f"{type(e).__name__}: {e}")
 
 def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
     con = sqlite3.connect(DB, timeout=30)
-    # 仅按 text_extracted 标志筛选：text_extracted=1 的书必有真实正文，其余(text_extracted=0/NULL)都需(重)抽取。
-    # 不再扫 book_text 的 length()（会读全量 3GB 文本导致 MemoryError）。
-    q = """SELECT b.id,b.file_path,b.file_format FROM books b
-           WHERE b.status='active' AND b.text_extracted<>1"""
+    if mode == "ocr":
+        # OCR 重跑模式：仅重抽「已抽过(text_extracted=1)但正文极短(<=200字,疑似书名兜底)」的 PDF。
+        # 适用场景：装好 tesseract+chi_sim 后，把之前因无 OCR 而回落书名的扫描版 PDF 重新识别。
+        # 注意：>50MB 大文件在 extract_text_for 内仍走跳过逻辑(不 OCR)，故超大扫描版需另行处理。
+        q = """SELECT b.id,b.file_path,b.file_format FROM books b
+               JOIN book_text bt ON bt.id=b.id
+               WHERE b.status='active' AND b.file_format='pdf'
+                 AND b.text_extracted=1 AND length(bt.text_content)<=200"""
+        L("[mode] ocr-rerun: 仅重抽疑似书名兜底的扫描版PDF(正文<=200字)")
+    else:
+        # 仅按 text_extracted 标志筛选：text_extracted=1 的书必有真实正文，其余(text_extracted=0/NULL)都需(重)抽取。
+        # 不再扫 book_text 的 length()（会读全量 3GB 文本导致 MemoryError）。
+        q = """SELECT b.id,b.file_path,b.file_format FROM books b
+               WHERE b.status='active' AND b.text_extracted<>1"""
     rows = con.execute(q).fetchall()
     con.close()
     L(f"[start] candidates={len(rows)} workers={WORKERS} timeout={PER_BOOK_TIMEOUT}s")
