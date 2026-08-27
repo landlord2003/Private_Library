@@ -165,6 +165,24 @@ def _tool_status():
         out[t] = {"done": done, "skip": skip, "running": running}
     return out
 
+
+def _lib_stats():
+    """图书馆规模 + 数据覆盖率 + 各工具续跑进度，供统计页/接口展示。"""
+    def _c(sql):
+        return dbq(sql)[0]['c']
+    total = _c("SELECT COUNT(*) c FROM books WHERE status='active'")
+    total_media = _c("SELECT COUNT(*) c FROM media WHERE status='active'")
+    cov = {
+        "cover": _c("SELECT COUNT(*) c FROM books WHERE status='active' AND cover_path IS NOT NULL AND cover_path<>''"),
+        "summary": _c("SELECT COUNT(*) c FROM books WHERE status='active' AND summary IS NOT NULL AND summary<>''"),
+        "publisher": _c("SELECT COUNT(*) c FROM books WHERE status='active' AND publisher IS NOT NULL AND publisher<>''"),
+        "isbn": _c("SELECT COUNT(*) c FROM books WHERE status='active' AND isbn IS NOT NULL AND isbn<>''"),
+        "language": _c("SELECT COUNT(*) c FROM books WHERE status='active' AND language IS NOT NULL AND language<>''"),
+        "text_extracted": _c("SELECT COUNT(*) c FROM books WHERE status='active' AND text_extracted=1"),
+        "named": _c("SELECT COUNT(*) c FROM books WHERE status='active' AND normalized_title IS NOT NULL AND normalized_title<>'' AND normalized_title NOT LIKE 'upload_%'"),
+    }
+    return {"total_books": total, "total_media": total_media, "coverage": cov, "tools": _tool_status()}
+
 def migrate_schema():
     """P0：阅读进度(reading_status/last_page) + 智能书架(shelves)。幂等，可在启动时安全重复调用。"""
     c = sqlite3.connect(DB, timeout=30)
@@ -258,7 +276,7 @@ def cc(c): return {'计算机与编程':'#1677ff','历史与人文':'#fa8c16','�
 
 CSS = """* { margin:0; padding:0; box-sizing:border-box; } body { font-family: "Microsoft YaHei", Arial, sans-serif; background: #f5f5f5; display: flex; min-height: 100vh; } nav { width: 250px; background: #fff; padding: 20px 0; box-shadow: 2px 0 8px rgba(0,0,0,0.05); } nav h2 { padding: 0 20px 20px; color: #1677ff; font-size: 18px; border-bottom: 1px solid #f0f0f0; margin-bottom: 10px; } nav a { display: block; padding: 12px 20px; color: #333; text-decoration: none; font-size: 15px; } nav a:hover { background: #e6f4ff; color: #1677ff; } main { flex: 1; padding: 24px; overflow-y: auto; } .sb { background: #fff; padding: 20px; border-radius: 8px; text-align: center; min-width: 140px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); text-decoration: none; color: inherit; } .sb .n { font-size: 28px; font-weight: bold; } .sb .l { font-size: 13px; color: #999; margin-top: 4px; } .row { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; } .tag { display: inline-block; padding: 3px 10px; border-radius: 4px; font-size: 12px; margin: 3px; color: #fff; } .panel { background: #fff; padding: 16px; border-radius: 8px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); } .panel h3 { margin-bottom: 12px; font-size: 16px; } .sch { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; } .sch input, .sch select { padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; } .sch input { flex: 1; min-width: 180px; } .sch button { padding: 8px 20px; background: #1677ff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; } .bk { background: #fff; border-radius: 8px; padding: 14px; margin-bottom: 8px; display: flex; gap: 12px; align-items: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05); cursor: pointer; } .bk:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.1); } .bk img { width: 50px; height: 70px; object-fit: cover; border-radius: 4px; flex-shrink: 0; } .bk .cv { width: 50px; height: 70px; border-radius: 4px; flex-shrink: 0; background: linear-gradient(135deg, #667eea, #764ba2); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 22px; } .bk .info { flex: 1; min-width: 0; } .bk .t { font-weight: bold; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .bk .m { font-size: 12px; color: #999; margin-top: 2px; } a { color: #1677ff; text-decoration: none; } a:hover { text-decoration: underline; } .co { color: #999; } .btn { padding: 8px 20px; background: #1677ff; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; margin: 2px; } .bb2 { background: #fff; color: #1677ff; border: 1px solid #1677ff; } .detail { background: #fff; border-radius: 12px; padding: 24px; max-width: 800px; margin: 0 auto; box-shadow: 0 2px 12px rgba(0,0,0,0.1); overflow: hidden; } .detail h1 { margin-bottom: 16px; font-size: 22px; margin-right: 170px; } .detail .meta { margin-bottom: 16px; color: #666; font-size: 14px; line-height: 1.8; margin-right: 170px; } .detail .sec { margin: 16px 0; } .detail-cover { float: right; width: 150px; height: 200px; object-fit: contain; border-radius: 8px; background: #f5f5f5; margin-left: 16px; } .detail-cv { float: right; width: 150px; height: 200px; border-radius: 8px; background: linear-gradient(135deg, #667eea, #764ba2); display: flex; align-items: center; justify-content: center; color: #fff; font-size: 48px; margin-left: 16px; }"""
 
-NAV = '<nav><h2>📚 我的图书馆</h2><a href="/">🏠 首页</a><a href="/?p=books">📖 书库 ({B})</a><a href="/?p=media">🎧 媒体库 ({M})</a><a href="/?p=import">📥 导入新书</a><a href="/?p=notes">📝 笔记 ({N})</a><a href="/?p=tools">🛠️ 工具中心</a><a href="/?p=title-norm">📐 书名规则化</a><div class="cat-tree">{TREE}</div><div class="shelf-box">{SHELVES}</div><div class="theme-row"><button class="theme-btn" onclick="toggleTheme()" title="切换深浅色">🌙 深色</button></div></nav>'
+NAV = '<nav><h2>📚 我的图书馆</h2><a href="/">🏠 首页</a><a href="/?p=books">📖 书库 ({B})</a><a href="/?p=media">🎧 媒体库 ({M})</a><a href="/?p=import">📥 导入新书</a><a href="/?p=notes">📝 笔记 ({N})</a><a href="/?p=tools">🛠️ 工具中心</a><a href="/?p=stats">📊 统计</a><a href="/?p=title-norm">📐 书名规则化</a><div class="cat-tree">{TREE}</div><div class="shelf-box">{SHELVES}</div><div class="theme-row"><button class="theme-btn" onclick="toggleTheme()" title="切换深浅色">🌙 深色</button></div></nav>'
 
 EXTRA_CSS = """
 .cat-tree{padding:8px 0 14px;border-top:1px solid #f0f0f0;margin-top:6px;max-height:calc(100vh - 220px);overflow-y:auto}
@@ -2103,6 +2121,27 @@ class H(http.server.SimpleHTTPRequestHandler):
             if path == "/api/media/transcribe-one": self.json(run_transcribe_one_async(data.get('media_id',''))); return
             if path == "/api/tools/run": self.json(_tool_run(data)); return
             if path == "/api/title-norm/recompute": self.json(_title_norm_recompute()); return
+            if path == "/api/title-norm/adopt":
+                ids = (data or {}).get("ids", [])
+                adopted = skipped = 0
+                if ids:
+                    conn = sqlite3.connect(DB, timeout=30); cur = conn.cursor()
+                    for bid in ids:
+                        try:
+                            bid = str(bid).strip()
+                            cur.execute("SELECT title FROM books WHERE id=?", (bid,))
+                            row = cur.fetchone()
+                            if not row: skipped += 1; continue
+                            t = row[0] or ""
+                            nt = normalize_title(t)
+                            if not nt or nt.startswith("upload_") or nt == (t or "").strip():
+                                skipped += 1; continue
+                            cur.execute("UPDATE books SET title=?, normalized_title=? WHERE id=?", (nt, nt, bid))
+                            adopted += 1
+                        except Exception:
+                            skipped += 1
+                    conn.commit(); conn.close()
+                self.json({"adopted": adopted, "skipped": skipped}); return
             if path.startswith("/api/media/") and path.endswith("/edit"):
                 mid=path.split("/")[3]; title=data.get('title','').strip()
                 if title: dbe("UPDATE media SET title=?, updated_at=datetime('now') WHERE id=?",(title,mid)); self.json({"ok":True,"title":title})
@@ -2239,6 +2278,7 @@ class H(http.server.SimpleHTTPRequestHandler):
             elif path=="/api/tools/status": self.json(_tool_status())
             elif path=="/api/task-status": self.json({"classify":_task_status.get('cr_r',{}),"summarize":_task_status.get('sr_r',{}),"extract":_task_status.get('er_r',{}),"transcribe":_task_status.get('tr_r',{}),"media_summarize":_task_status.get('ms_r',{}),"scan_import":_task_status.get('ir_r',{}),"metadata":_task_status.get('mr_r',{})})
             elif path=="/api/title-norm/recompute-status": self.json(_title_norm_recompute_status()); return
+            elif path=="/api/stats": self.json(_lib_stats()); return
             elif path.startswith("/api/books/") and path.endswith("/notes"):
                 bid=path.split("/")[3]
                 rows=dbq("SELECT id,note,page,created_at FROM reading_notes WHERE book_id=? ORDER BY created_at DESC",(bid,))
@@ -2851,6 +2891,26 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             h+='<div class=panel><h3>⚡ 在服工具（首页 AI 面板直接触发）</h3>'
             h+='<p class=co>AI 分类 / 提取文本 / AI 摘要 / 补全元数据 / 媒体转录 / 转录→摘要 —— 见 <a href="/">首页「AI 处理」面板</a>。均已接入续跑进度。</p></div>'
             h+="<script>function TR(t,re){var lim=(t=='kg'?document.getElementById('kgLimit').value:(t=='meta'?document.getElementById('metaLimit').value:document.getElementById('sumLimit').value));var md=(t=='meta'?document.getElementById('metaMode').value:'');var b=JSON.stringify({tool:t,limit:lim,mode:md,regen:!!re});var x=new XMLHttpRequest();x.open('POST','/api/tools/run');x.setRequestHeader('Content-Type','application/json');x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById(t+'Res').textContent=r.msg||(r.ok?'已启动':'失败');TP();}catch(e){document.getElementById(t+'Res').textContent='error'}};x.send(b);}function TP(){var x=new XMLHttpRequest();x.open('GET','/api/tools/status');x.onload=function(){try{var r=JSON.parse(x.responseText);var s='';for(var k in r){if(k=='_error'){s+='读取错误:'+r[k];continue;}var v=r[k];s+=k+': 完成'+v.done+' 跳过'+v.skip+(v.running?' [运行中]':'')+'  ';}document.getElementById('toolStat').textContent=s;}catch(e){}};x.send();}TP();</script>"
+        elif pn=='stats':
+            st = _lib_stats()
+            total = st['total_books']; tm = st['total_media']
+            cov = st['coverage']
+            h+='<h2>📊 图书馆统计</h2>'
+            h+='<div class=panel><h3>📦 规模</h3><div class=row>'
+            h+='<a class=sb><div class=n style=color:#1677ff>'+str(total)+'</div><div class=l>📚 书籍</div></a>'
+            h+='<a class=sb><div class=n style=color:#fa8c16>'+str(tm)+'</div><div class=l>🎧 媒体</div></a></div></div>'
+            h+='<div class=panel><h3>🧬 数据覆盖率（按 '+str(total)+' 本书计）</h3><table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f3f3f3"><th style="border:1px solid #ddd;padding:6px;text-align:left">字段</th><th style="border:1px solid #ddd;padding:6px;text-align:left">已填</th><th style="border:1px solid #ddd;padding:6px;text-align:left">覆盖率</th><th style="border:1px solid #ddd;padding:6px;text-align:left">进度</th></tr>'
+            labels={'cover':'封面','summary':'简介','publisher':'出版社','isbn':'ISBN','language':'语言','text_extracted':'全文提取','named':'已规则化命名'}
+            for k,lab in labels.items():
+                v=cov.get(k,0); pct=(v*100.0/total) if total else 0
+                h+='<tr><td style="border:1px solid #ddd;padding:6px">'+lab+'</td><td style="border:1px solid #ddd;padding:6px">'+str(v)+'</td><td style="border:1px solid #ddd;padding:6px">'+('%.1f'%(pct))+'%</td><td style="border:1px solid #ddd;padding:6px;width:220px"><div style="background:#1677ff;height:10px;border-radius:5px;width:'+str(min(100,pct))+'%"></div></td></tr>'
+            h+='</table></div>'
+            h+='<div class=panel><h3>🛠️ 各工具续跑进度（progress.db）</h3><table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f3f3f3"><th style="border:1px solid #ddd;padding:6px;text-align:left">工具</th><th style="border:1px solid #ddd;padding:6px;text-align:left">已完成(done)</th><th style="border:1px solid #ddd;padding:6px;text-align:left">已跳过(skip)</th><th style="border:1px solid #ddd;padding:6px;text-align:left">状态</th></tr>'
+            tnames={'kg':'知识图谱 L1','meta':'元数据补全','summary':'摘要修复','extract':'提取文本','classify':'AI 分类','summarize':'AI 摘要','transcribe':'媒体转录','media_summarize':'媒体摘要','metadata':'在线元数据'}
+            for t,v in st['tools'].items():
+                run='🟢 运行中' if v.get('running') else '⚪ 空闲'
+                h+='<tr><td style="border:1px solid #ddd;padding:6px">'+tnames.get(t,t)+'</td><td style="border:1px solid #ddd;padding:6px">'+str(v.get('done',0))+'</td><td style="border:1px solid #ddd;padding:6px">'+str(v.get('skip',0))+'</td><td style="border:1px solid #ddd;padding:6px">'+run+'</td></tr>'
+            h+='</table></div>'
         elif pn=='title-norm':
             h+='<h2>📐 书名规则化对比表</h2>'
             _tn_page=int(qs.get('page',['1'])[0]); _tn_mode=qs.get('mode',['all'])[0]; _tn_q=qs.get('q',[''])[0]; _tn_ps=50
@@ -2870,20 +2930,23 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             h+='<div class=panel><p class=co>总书数 <b>'+str(_tot)+'</b> · 已被规则改写(存库) <b>'+str(_chg)+'</b> · 未变/无解回退 <b>'+str(_unc)+'</b> · 其中 upload_ 无解 <b>'+str(_up)+'</b> 本。</p>'
             h+='<p class=co>下表「规则化结果」为对<b>当前书名</b>实时套用 normalize_title() 规则所得（避免显示书名被后续补全更新造成的旧值漂移）。点「重算写回」(工具中心) 可把结果同步回 normalized_title 列。</p>'
             h+='<form class=sch method=get style="margin:8px 0"><input type=hidden name=p value=title-norm>模式<select name=mode><option value=all'+(' selected' if _tn_mode=='all' else '')+'>全部</option><option value=changed'+(' selected' if _tn_mode=='changed' else '')+'>仅被改写</option><option value=unchanged'+(' selected' if _tn_mode=='unchanged' else '')+'>仅未变</option><option value=upload'+(' selected' if _tn_mode=='upload' else '')+'>仅 upload_ 无解</option></select> <input name=q placeholder="搜索书名" value="'+he(_tn_q)+'"><button>筛选</button></form>'
-            h+='<table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f3f3f3"><th style="border:1px solid #ddd;padding:6px;text-align:left">#</th><th style="border:1px solid #ddd;padding:6px;text-align:left">原书名（当前）</th><th style="border:1px solid #ddd;padding:6px;text-align:left">规则化结果</th><th style="border:1px solid #ddd;padding:6px;text-align:left">状态</th></tr>'
+            h+='<table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f3f3f3"><th style="border:1px solid #ddd;padding:6px;text-align:left"><input type=checkbox id=selAll onclick="selAll(this)" title="全选本页"></th><th style="border:1px solid #ddd;padding:6px;text-align:left">#</th><th style="border:1px solid #ddd;padding:6px;text-align:left">原书名（当前）</th><th style="border:1px solid #ddd;padding:6px;text-align:left">规则化结果</th><th style="border:1px solid #ddd;padding:6px;text-align:left">状态</th></tr>'
             for _i,_r in enumerate(_rows):
                 _t=_r['title'] or ''
                 _nt=normalize_title(_t)
                 _st='改写' if _nt!=(_t or '').strip() else '未变'
                 if _nt.startswith('upload_'): _st='无解(random)'
-                h+='<tr><td style="border:1px solid #ddd;padding:6px">'+str((_tn_page-1)*_tn_ps+_i+1)+'</td><td style="border:1px solid #ddd;padding:6px">'+he(_t)+'</td><td style="border:1px solid #ddd;padding:6px">'+he(_nt)+'</td><td style="border:1px solid #ddd;padding:6px">'+_st+'</td></tr>'
+                h+='<tr><td style="border:1px solid #ddd;padding:6px"><input type=checkbox class=rowcb name=bid value="'+he(str(_r['id']))+'"></td><td style="border:1px solid #ddd;padding:6px">'+str((_tn_page-1)*_tn_ps+_i+1)+'</td><td style="border:1px solid #ddd;padding:6px">'+he(_t)+'</td><td style="border:1px solid #ddd;padding:6px">'+he(_nt)+'</td><td style="border:1px solid #ddd;padding:6px">'+_st+'</td></tr>'
             h+='</table>'
+            h+='<div style="margin:12px 0 4px"><label style="font-size:13px"><input type=checkbox id=selAll2 onclick="selAll(this)"> 全选本页</label> &nbsp; <button class=btn onclick="ADOPT()">✅ 采纳选中为正式书名</button> <span id=tnAdoptRes style="font-size:13px;color:#1677ff"></span></div>'
+            h+='<p class=co>「采纳为正式书名」将把勾选书的 <b>title</b> 改为上表「规则化结果」（upload_ 无解的书自动跳过，不会误覆盖）。</p>'
             h+='<div class=pager style="margin:10px 0">'
             if _tn_page>1: h+='<a class=btn href="/?p=title-norm&page='+str(_tn_page-1)+('&mode='+_tn_mode if _tn_mode!='all' else '')+('&q='+urllib.parse.quote(_tn_q) if _tn_q else '')+'">上一页</a> '
             h+=' 第 '+str(_tn_page)+'/'+str(_pages)+' 页（共 '+str(_tr)+' 条） '
             if _tn_page<_pages: h+='<a class=btn href="/?p=title-norm&page='+str(_tn_page+1)+('&mode='+_tn_mode if _tn_mode!='all' else '')+('&q='+urllib.parse.quote(_tn_q) if _tn_q else '')+'">下一页</a>'
             h+='</div>'
             h+='</div>'
+            h+='<script>function selAll(cb){document.querySelectorAll(".rowcb").forEach(function(x){x.checked=cb.checked;});}function ADOPT(){var ids=[];document.querySelectorAll(".rowcb:checked").forEach(function(x){ids.push(x.value);});var r=document.getElementById("tnAdoptRes");if(!ids.length){r.textContent="请先勾选至少一本";return;}if(!confirm("确认把选中的 "+ids.length+" 本书名采纳为正式书名？将覆盖当前 title。"))return;var x=new XMLHttpRequest();x.open("POST","/api/title-norm/adopt");x.setRequestHeader("Content-Type","application/json");x.onload=function(){try{var j=JSON.parse(x.responseText);r.textContent="已采纳 "+j.adopted+" 本，跳过 "+j.skipped+" 本（upload_无解不采纳）";setTimeout(function(){location.reload();},800);}catch(e){r.textContent="error";}};x.send(JSON.stringify({ids:ids}));}</script>'
         else:
             ts=ct.get('ts',0); import_rem=ct.get('import_rem',0); sum_rem=ct.get('sum_rem',0); no_text=ct.get('no_text',0)
             _ld=""
