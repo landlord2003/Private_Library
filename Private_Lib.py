@@ -187,6 +187,101 @@ def _lib_stats():
             fake += 1
     return {"total_books": total, "total_media": total_media, "coverage": cov, "fake_summary": fake, "tools": _tool_status()}
 
+def _tool_center_html():
+    """工具中心(卡片式)：标注每工具 作用 / 已完成工作量 / 成果入口 / 运行控制。"""
+    st = _lib_stats()
+    total = st['total_books'] or 1
+    cov = st['coverage']; tools = st['tools']; fake = st.get('fake_summary', 0)
+    def pct(n): return min(100, round((n or 0)*100.0/total, 1))
+    def bar(n, color):
+        return ('<div style="background:#eee;height:8px;border-radius:4px;width:100%%;margin-top:4px">'
+                '<div style="background:%s;height:8px;border-radius:4px;width:%s%%"></div></div>') % (color, pct(n))
+    def card(icon, name, purpose, wl_text, wl_n, color, rlink, rlabel, controls=''):
+        c = '<div style="flex:1 1 340px;min-width:300px;border:1px solid #e3e3e3;border-radius:10px;padding:14px;margin:6px;background:#fff">'
+        c += '<div style="font-size:15px;font-weight:700;margin-bottom:6px">%s %s</div>' % (icon, name)
+        c += '<div style="font-size:13px;color:#555;line-height:1.6;margin-bottom:8px">%s</div>' % purpose
+        c += '<div style="font-size:12px;color:#333;margin:6px 0 2px">📊 已完成工作量：<b>%s</b></div>' % wl_text
+        c += bar(wl_n, color)
+        if rlink:
+            c += '<div style="margin:8px 0"><a class=btn href="%s">🔗 %s</a></div>' % (rlink, rlabel)
+        if controls:
+            c += '<div style="margin-top:8px">%s</div>' % controls
+        c += '</div>'
+        return c
+    h = '<h2>🛠️ 工具中心</h2>'
+    h += '<p class=co>每个工具标注「作用 · 已完成工作量 · 成果入口」。进度来自 progress.db 与实时统计，停了不白跑；进程崩溃可续跑。</p>'
+    # 成果总览
+    h += '<div class=panel><h3>🏆 已落地成果总览</h3><div class=row>'
+    h += '<a class=sb href="/?p=title-norm"><div class=n style="color:#1677ff">%d</div><div class=l>📐 书名已规则化</div></a>' % cov.get('named',0)
+    h += '<a class=sb href="/?p=stats"><div class=n style="color:#52c41a">%d</div><div class=l>📄 已抽全文</div></a>' % cov.get('text_extracted',0)
+    h += '<a class=sb href="/?p=stats"><div class=n style="color:#fa8c16">%d</div><div class=l>🧬 图谱L1已生成</div></a>' % tools.get('kg',{}).get('done',0)
+    h += '<a class=sb href="/?p=stats"><div class=n style="color:#c0392b">%d</div><div class=l>⚠️ 待修假摘要</div></a>' % fake
+    h += '</div></div>'
+    # 离线批处理
+    h += '<div style="display:flex;flex-wrap:wrap;margin-top:6px">'
+    h += '<div style="width:100%;font-weight:700;margin:10px 6px 0;color:#722ed1">⚙️ 离线批处理工具（tools/，可续跑）</div>'
+    ext_n = cov.get('text_extracted',0)
+    h += card('📄','提取文本',
+        '抽取 PDF/EPUB/MOBI/TXT 正文存入 book_text，供 AI 摘要、知识图谱、全文检索。PDF 仅取前 5–30 页、上限 20 万字；&gt;50MB 大文件与无 tesseract 的扫描版回落书名。',
+        '%d / %d 本 (%.1f%%)' % (ext_n, total, pct(ext_n)), ext_n, '#52c41a',
+        '/?p=stats', '查看全文提取覆盖率',
+        '<button class=btn onclick="EXTR()">▶ 全量抽取(续跑)</button> <span id=extRes></span>')
+    nm_n = cov.get('named',0)
+    h += card('📐','书名规则化',
+        '套用 normalize_title() 清洗镜像站点标记/随机ID/作者括号/促销词/扩展名，展示「原书名→规则化」对比，可勾选采纳为正式书名。',
+        '%d / %d 本已清洗 (%.1f%%)' % (nm_n, total, pct(nm_n)), nm_n, '#1677ff',
+        '/?p=title-norm', '查看对比表 / 采纳',
+        '<button class=btn onclick="TNREC()">🔄 重算写回</button> <span id=tnRes></span>')
+    kg = tools.get('kg',{})
+    h += card('🧬','知识图谱 L1',
+        '结构层实体/关系抽取（不需 Ollama），落地 P2-D 知识图谱。基于已抽正文与书名生成。',
+        '已完成 %d 本 · 跳过 %d · %s' % (kg.get('done',0), kg.get('skip',0), '🟢运行中' if kg.get('running') else '⚪空闲'),
+        kg.get('done',0), '#fa8c16', '/?p=stats', '查看工具进度',
+        '<input id=kgLimit value=300 style="width:70px"> <button class=btn onclick="TR(\'kg\',false)">▶ 生成</button> <button class=btn onclick="TR(\'kg\',true)">🔄 清空重跑</button> <span id=kgRes></span>')
+    mt = tools.get('meta',{})
+    pub_n = cov.get('publisher',0); isbn_n = cov.get('isbn',0)
+    h += card('🌐','元数据补全',
+        '用 Open Library(主源,直连免代理) + Google Books 回填出版社/ISBN/年份/简介。根治 Douban 403。',
+        '出版社 %.1f%% · ISBN %.1f%% · 已完成 %d 本' % (pct(pub_n), pct(isbn_n), mt.get('done',0)),
+        pub_n, '#13c2c2', '/?p=stats', '查看元数据覆盖率',
+        '模式<select id=metaMode><option value=fast>fast</option><option value=full>full</option></select> <input id=metaLimit value=200 style="width:70px"> <button class=btn onclick="TR(\'meta\',false)">▶ 跑一批</button> <button class=btn onclick="TR(\'meta\',true)">🔁 重试失败</button> <span id=metaRes></span>')
+    sm = tools.get('summary',{})
+    h += card('✏️','摘要修复',
+        '清掉 %d 条「假摘要」(导入时无正文被 LLM 编的模板示例)，用真全文经本机 Ollama 重跑真摘要。需 Ollama 在线。' % fake,
+        '待修 %d 本 · 已完成 %d 本 · %s' % (fake, sm.get('done',0), '🟢运行中' if sm.get('running') else '⚪空闲'),
+        max(0, fake), '#c0392b', '/?p=stats', '查看摘要健康',
+        '<span id=sumPending style="color:#c0392b;font-size:12px"></span><br><input id=sumLimit value=20000 style="width:80px"> <button class=btn onclick="TR(\'summary\',false)">▶ 跑一批</button> <button class=btn onclick="TR(\'summary\',false,20000)">🔥 全量修复</button> <span id=sumRes></span>')
+    h += '</div>'
+    # 在服实时
+    h += '<div style="display:flex;flex-wrap:wrap;margin-top:6px">'
+    h += '<div style="width:100%;font-weight:700;margin:10px 6px 0;color:#1677ff">⚡ 在服实时工具（首页「AI 处理」面板触发）</div>'
+    h += card('🏷️','AI 分类','导入或手动触发，调用本机 Ollama 给书打一级/二级分类+标签+难度。','进度 %d 本' % tools.get('classify',{}).get('done',0), tools.get('classify',{}).get('done',0), '#1677ff', '', '', '<a class=btn href="/">前往首页 AI 面板</a>')
+    h += card('🤖','AI 摘要','基于正文生成结构化 AI 摘要(一句话/观点/概念/读者/难度)。','进度 %d 本' % tools.get('summarize',{}).get('done',0), tools.get('summarize',{}).get('done',0), '#1677ff', '', '', '<a class=btn href="/">前往首页 AI 面板</a>')
+    h += card('🔎','在线元数据','导入时实时调 Open Library 补全出版社/ISBN。','进度 %d 本' % tools.get('metadata',{}).get('done',0), tools.get('metadata',{}).get('done',0), '#1677ff', '', '', '<a class=btn href="/">前往首页 AI 面板</a>')
+    h += card('🎧','媒体转录','Whisper 转录音视频为文字，存 media.transcript。','进度 %d 条' % tools.get('transcribe',{}).get('done',0), tools.get('transcribe',{}).get('done',0), '#1677ff', '', '', '<a class=btn href="/?p=media">前往媒体库</a>')
+    h += card('📝','媒体摘要','基于转录文本生成媒体 AI 摘要。','进度 %d 条' % tools.get('media_summarize',{}).get('done',0), tools.get('media_summarize',{}).get('done',0), '#1677ff', '', '', '<a class=btn href="/?p=media">前往媒体库</a>')
+    h += '</div>'
+    # JS：复用 TR/TP/SP/TNREC + 新增 EXTR
+    h += '<div style="margin-top:10px"><button class=btn onclick="TP()">🔄 刷新进度</button> <span id=toolStat style="font-size:12px;color:#666"></span></div>'
+    js = '''<script>
+function EXTR(){var x=new XMLHttpRequest();x.open("POST","/api/extract-batch");x.setRequestHeader("Content-Type","application/json");
+x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById("extRes").textContent=r.status||(r.ok?"已启动":"失败");TP();}catch(e){document.getElementById("extRes").textContent="error"}};
+x.send(JSON.stringify({count:20000}));}
+function TNREC(){var x=new XMLHttpRequest();x.open("POST","/api/title-norm/recompute");x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById("tnRes").textContent=r.msg||(r.ok?"已启动":"失败");if(r.ok)TNPOLL()}catch(e){document.getElementById("tnRes").textContent="error"}};x.send();}
+function TNPOLL(){var x=new XMLHttpRequest();x.open("GET","/api/title-norm/recompute-status");x.onload=function(){try{var r=JSON.parse(x.responseText);var s=(r.running?"重算中 "+r.done+"/"+r.total:"完成 "+r.done+"/"+r.total)+(r.error?" 错误:"+r.error:"");document.getElementById("tnRes").textContent=s;if(r.running)setTimeout(TNPOLL,1500)}catch(e){}};x.send();}
+function TR(t,re,lf){var lim=lf||(t=='kg'?document.getElementById('kgLimit').value:(t=='meta'?document.getElementById('metaLimit').value:document.getElementById('sumLimit').value));
+var md=(t=='meta'?document.getElementById('metaMode').value:'');
+var b=JSON.stringify({tool:t,limit:lim,mode:md,regen:!!re});
+var x=new XMLHttpRequest();x.open('POST','/api/tools/run');x.setRequestHeader('Content-Type','application/json');
+x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById(t+'Res').textContent=r.msg||(r.ok?'已启动':'失败');TP();}catch(e){document.getElementById(t+'Res').textContent='error'}};x.send(b);}
+function TP(){var x=new XMLHttpRequest();x.open('GET','/api/tools/status');x.onload=function(){try{var r=JSON.parse(x.responseText);var s='';for(var k in r){if(k=='_error'){s+='读取错误:'+r[k];continue;}var v=r[k];s+=k+': 完成'+v.done+' 跳过'+v.skip+(v.running?' [运行中]':'')+'  ';}document.getElementById('toolStat').textContent=s;}catch(e){}};x.send();}
+function SP(){var x=new XMLHttpRequest();x.open('GET','/api/summary-fix/pending');x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById('sumPending').textContent='待修假摘要 '+r.pending+' 本（有全文可重跑 '+r.has_text+' · 无全文将清空 '+r.no_text+'）';}catch(e){}};x.send();}
+TP();SP();
+</script>'''
+    h += js
+    return h
+
+
 def migrate_schema():
     """P0：阅读进度(reading_status/last_page) + 智能书架(shelves)。幂等，可在启动时安全重复调用。"""
     c = sqlite3.connect(DB, timeout=30)
@@ -2927,21 +3022,8 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             h+='<button class=btn onclick="SCAN()" style="background:#722ed1">🔍 开始扫描导入</button>'
             h+='<div id=scanRes style=margin-top:8px;font-size:13px></div></div>'
         elif pn=='tools':
-            h+='<h2>🛠️ 工具中心</h2>'
-            h+='<div class=panel><h3>📦 离线工具（tools/，可续跑 · 不依赖盘符）</h3>'
-            h+='<p class=co>独立于主服务运行，进度存 progress.db，停了不白跑。点「运行」即后台启动；也可直接双击 tools/run_*.bat。需 Ollama 的工具（摘要修复）请确认本机 Ollama 已启动。</p>'
-            h+='<div style="margin:10px 0"><b>① 知识图谱 L1</b>（结构层，不需 Ollama）<br>数量<input id=kgLimit value=300 style="width:70px;margin:0 6px"><button class=btn onclick="TR(\'kg\',false)">▶ 生成</button> <button class=btn onclick="TR(\'kg\',true)">🔄 清空重跑</button> <span id=kgRes></span></div>'
-            h+='<div style="margin:10px 0"><b>② 元数据补全</b>（Open Library 主源，直连无需代理；Google Books 补充）<br>模式<select id=metaMode><option value=fast>fast 铺年份/ISBN/出版社</option><option value=full>full 补出版社/简介</option></select> 数量<input id=metaLimit value=200 style="width:70px;margin:0 6px"><button class=btn onclick="TR(\'meta\',false)">▶ 跑一批</button> <button class=btn onclick="TR(\'meta\',true)">🔁 重试失败</button> <span id=metaRes></span></div>'
-            h+='<div style="margin:10px 0"><b>③ 摘要修复</b>（清假摘要+重跑真摘要，需本机 Ollama 在线）<br><span id=sumPending style="color:#c0392b;font-size:13px"></span><br>数量<input id=sumLimit value=20000 style="width:80px;margin:0 6px"><button class=btn onclick="TR(\'summary\',false)">▶ 跑一批</button> <button class=btn onclick="TR(\'summary\',false,20000)">🔥 全量修复</button> <span id=sumRes></span></div>'
-            h+='<div style="margin-top:10px"><button class=btn onclick="TP()">🔄 刷新进度</button> <span id=toolStat style="font-size:13px;color:#666"></span></div>'
-            h+='<div id=toolLog style="margin-top:8px;font-size:12px;color:#666;white-space:pre-wrap"></div></div>'
-            h+='<div class=panel><h3>📐 书名规则化（展示清洗成果 + 修正漂移）</h3>'
-            h+='<p class=co>昨日已对全库 15074 本批量套用 normalize_title() 规则，约 89% 书名被清洗（去镜像站点标记/随机ID/作者括号/促销词/扩展名等）。下表实时展示「原书名 → 规则化结果」，并可在发现漂移时一键重算写回。</p>'
-            h+='<div style="margin:10px 0"><a class=btn href="/?p=title-norm">📊 查看对比表</a> <button class=btn onclick="TNREC()">🔄 重算写回 normalized_title</button> <span id=tnRes></span></div></div>'
-            h+='<script>function TNREC(){var x=new XMLHttpRequest();x.open("POST","/api/title-norm/recompute");x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById("tnRes").textContent=r.msg||(r.ok?"已启动":"失败");if(r.ok)TNPOLL()}catch(e){document.getElementById("tnRes").textContent="error"}};x.send();}function TNPOLL(){var x=new XMLHttpRequest();x.open("GET","/api/title-norm/recompute-status");x.onload=function(){try{var r=JSON.parse(x.responseText);var s=(r.running?"重算中 "+r.done+"/"+r.total:"完成 "+r.done+"/"+r.total)+(r.error?" 错误:"+r.error:"");document.getElementById("tnRes").textContent=s;if(r.running)setTimeout(TNPOLL,1500)}catch(e){}};x.send();}</script>'
-            h+='<div class=panel><h3>⚡ 在服工具（首页 AI 面板直接触发）</h3>'
-            h+='<p class=co>AI 分类 / 提取文本 / AI 摘要 / 补全元数据 / 媒体转录 / 转录→摘要 —— 见 <a href="/">首页「AI 处理」面板</a>。均已接入续跑进度。</p></div>'
-            h+="<script>function TR(t,re,lf){var lim=lf||(t=='kg'?document.getElementById('kgLimit').value:(t=='meta'?document.getElementById('metaLimit').value:document.getElementById('sumLimit').value));var md=(t=='meta'?document.getElementById('metaMode').value:'');var b=JSON.stringify({tool:t,limit:lim,mode:md,regen:!!re});var x=new XMLHttpRequest();x.open('POST','/api/tools/run');x.setRequestHeader('Content-Type','application/json');x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById(t+'Res').textContent=r.msg||(r.ok?'已启动':'失败');TP();}catch(e){document.getElementById(t+'Res').textContent='error'}};x.send(b);}function TP(){var x=new XMLHttpRequest();x.open('GET','/api/tools/status');x.onload=function(){try{var r=JSON.parse(x.responseText);var s='';for(var k in r){if(k=='_error'){s+='读取错误:'+r[k];continue;}var v=r[k];s+=k+': 完成'+v.done+' 跳过'+v.skip+(v.running?' [运行中]':'')+'  ';}document.getElementById('toolStat').textContent=s;}catch(e){}};x.send();}function SP(){var x=new XMLHttpRequest();x.open('GET','/api/summary-fix/pending');x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById('sumPending').textContent='待修假摘要 '+r.pending+' 本（有全文可重跑 '+r.has_text+' · 无全文将清空 '+r.no_text+'）';}catch(e){}};x.send();}TP();SP();</script>"
+            h += _tool_center_html()
+
         elif pn=='stats':
             st = _lib_stats()
             total = st['total_books']; tm = st['total_media']
