@@ -58,9 +58,9 @@ if (Test-Path $chi) {
     $haveChi = $true
 } else {
     $urls = @(
-        "https://raw.githubusercontent.com/tesseract-ocr/tessdata/main/chi_sim.traineddata",
+        "https://kkgithub.com/tesseract-ocr/tessdata/raw/main/chi_sim.traineddata",
         "https://ghproxy.com/https://github.com/tesseract-ocr/tessdata/raw/main/chi_sim.traineddata",
-        "https://kkgithub.com/tesseract-ocr/tessdata/raw/main/chi_sim.traineddata"
+        "https://raw.githubusercontent.com/tesseract-ocr/tessdata/main/chi_sim.traineddata"
     )
     foreach ($u in $urls) {
         try {

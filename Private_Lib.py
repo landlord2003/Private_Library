@@ -275,7 +275,7 @@ function EXTR(){var x=new XMLHttpRequest();x.open("POST","/api/extract-batch");x
 x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById("extRes").textContent=r.status||(r.ok?"已启动":"失败");TP();}catch(e){document.getElementById("extRes").textContent="error"}};
 x.send(JSON.stringify({count:20000}));}
 function EXTR_OCR(){var x=new XMLHttpRequest();x.open("POST","/api/extract-ocr");x.setRequestHeader("Content-Type","application/json");
-x.onload=function(){try{var r=JSON.parse(x.responseText);if(r.status=="no_tesseract"){document.getElementById("ocrRes").textContent="⚠️ 未装tesseract，先跑 install_tesseract.bat";return;}document.getElementById("ocrRes").textContent=r.status||"已启动";OCRPOLL();}catch(e){document.getElementById("ocrRes").textContent="error"}};
+x.onload=function(){try{var r=JSON.parse(x.responseText);if(r.status=="no_tesseract"){document.getElementById("ocrRes").textContent="⚠️ 未装tesseract，先跑 install_tesseract.bat";return;}if(r.status=="no_chi_sim"){document.getElementById("ocrRes").textContent="⚠️ 缺中文包chi_sim，OCR无法识别中文，请把chi_sim.traineddata放入tessdata";return;}document.getElementById("ocrRes").textContent=r.status||"已启动";OCRPOLL();}catch(e){document.getElementById("ocrRes").textContent="error"}};
 x.send(JSON.stringify({}));}
 function OCRPOLL(){var x=new XMLHttpRequest();x.open("GET","/api/extract-ocr/status");x.onload=function(){try{var r=JSON.parse(x.responseText);var s=(r.running?"OCR中 "+r.done+"/"+r.total:"完成 "+r.done+"/"+r.total);document.getElementById("ocrRes").textContent=s;if(r.running)setTimeout(OCRPOLL,2000)}catch(e){}};x.send();}
 function TNREC(){var x=new XMLHttpRequest();x.open("POST","/api/title-norm/recompute");x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById("tnRes").textContent=r.msg||(r.ok?"已启动":"失败");if(r.ok)TNPOLL()}catch(e){document.getElementById("tnRes").textContent="error"}};x.send();}
@@ -1381,6 +1381,15 @@ def run_extract_ocr_async():
     if _task_status.get('eor'): return {"status":"running"}
     if not shutil.which("tesseract") and not shutil.which("tesseract.exe"):
         return {"status":"no_tesseract", "msg":"本机未安装 tesseract，请先运行 tools/install_tesseract.bat"}
+    # chi_sim 中文包检测：tesseract 已装但缺 chi_sim 时 OCR 会静默空转(回落书名)
+    try:
+        import subprocess as _sp
+        ts = shutil.which("tesseract") or shutil.which("tesseract.exe")
+        out = _sp.run([ts, "--list-langs"], capture_output=True, text=True, timeout=10).stdout
+        if "chi_sim" not in out:
+            return {"status":"no_chi_sim", "msg":"tesseract 已装但缺中文包 chi_sim，OCR 无法识别中文。请把 chi_sim.traineddata 放入 tessdata 目录，或重跑 tools/install_tesseract.bat"}
+    except Exception:
+        pass
     _task_status['eor'] = True
     _task_status['eor_r'] = {"done":0,"total":0,"running":True}
     def w():
