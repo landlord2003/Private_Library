@@ -1244,13 +1244,9 @@ def run_extract_async(count=10):
     def w():
         try:
             # 20260827 P0修复：原续跑条件 `text_content IS NOT NULL` 会把“空字符串''(non-null)的空壳行”当成已提取而永久跳过。
-            # 改为同时重抽 text_content 为 NULL 或长度<=10 的书（覆盖迁移产生的空壳行），并排除已成功(text_extracted=1)的书。
-            books = dbq("""SELECT id,file_path,file_format,title FROM books
-                WHERE status='active'
-                  AND text_extracted <> 1
-                  AND (id NOT IN (SELECT id FROM book_text)
-                       OR id IN (SELECT id FROM book_text WHERE text_content IS NULL OR length(text_content)<=10))
-                LIMIT ?""",(int(count),))
+            # 改为仅按 text_extracted 标志筛选：text_extracted=1 的书必有真实正文，其余(0/NULL)都需(重)抽取。
+            # 不再扫 book_text 的 length()（会读全量 3GB 文本导致 MemoryError）。
+            books = dbq("SELECT id,file_path,file_format,title FROM books WHERE status='active' AND text_extracted <> 1 LIMIT ?",(int(count),))
             rv = {"done":0,"total":len(books)}
             for b in books:
                 try:
