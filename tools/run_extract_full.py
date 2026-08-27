@@ -46,6 +46,25 @@ def main():
                WHERE b.status='active' AND b.text_extracted<>1"""
     rows = con.execute(q).fetchall()
     con.close()
+    # 大文件预标记：>50MB 的文件在 extract_text_for 内走跳过逻辑(不抽正文，仅回落书名)，
+    # 但不会置 text_extracted=1，导致续跑/OCR 模式反复把它们重选进来死循环。
+    # 这里一次性标记为大文件已处理(置 text_extracted=1, 空正文)，移出候选集，
+    # 两种模式(全量/ocr)都排除，避免对超大扫描版反复抽。
+    BIG = 50 * 1024 * 1024
+    big_ids, real_rows = [], []
+    for r in rows:
+        try:
+            if os.path.getsize(r[1]) > BIG:
+                big_ids.append(r[0]); continue
+        except OSError:
+            pass
+        real_rows.append(r)
+    if big_ids:
+        c2 = sqlite3.connect(DB, timeout=30)
+        c2.executemany("UPDATE books SET text_extracted=1 WHERE id=?", [(i,) for i in big_ids])
+        c2.commit(); c2.close()
+        L(f"[skip-big] marked {len(big_ids)} files >50MB as processed (excluded from resume/ocr)")
+    rows = real_rows
     workers = 2 if mode == "ocr" else WORKERS
     timeout = 180 if mode == "ocr" else PER_BOOK_TIMEOUT
     L(f"[start] candidates={len(rows)} mode={mode} workers={workers} timeout={timeout}s")
