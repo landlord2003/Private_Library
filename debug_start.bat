@@ -8,9 +8,6 @@ set "PY=python"
 if exist "%USERPROFILE%\.workbuddy\binaries\python\versions\3.13.12\python.exe" set "PY=%USERPROFILE%\.workbuddy\binaries\python\versions\3.13.12\python.exe"
 if not exist "%USERPROFILE%\.workbuddy\binaries\python\versions\3.13.12\python.exe" if exist "C:\Users\Lenovo\.workbuddy\binaries\python\versions\3.13.12\python.exe" set "PY=C:\Users\Lenovo\.workbuddy\binaries\python\versions\3.13.12\python.exe"
 
-REM Metadata online fill switch: 1=built-in slow crawler thread; 0=off (use tools\run_meta.bat)
-set "LIB_METADATA_ONLINE=0"
-
 echo Using Python: %PY%
 echo Stopping old service on port 8000 (if any)...
 for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr /i ":8000" ^| findstr /i "LISTENING"') do (
@@ -19,10 +16,11 @@ for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr /i ":8000" ^| findstr 
 )
 timeout /t 1 >nul
 
-echo Starting Private_Lib.py (live logs below; window stays open while running)...
-"%PY%" Private_Lib.py
-if errorlevel 1 (
-    echo.
-    echo [START FAILED] See error above. Press any key to close.
-    pause >nul
-)
+echo Starting Private_Lib.py, logging to start_err.log ...
+"%PY%" Private_Lib.py > start_err.log 2>&1
+echo.
+echo [Process exited] Now opening start_err.log in Notepad.
+echo   - If it shows "listening on ...8000", the server started OK.
+echo   - If it shows a red error, copy that text and send it to me.
+pause
+notepad start_err.log
