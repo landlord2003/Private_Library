@@ -21,6 +21,8 @@ def safe(name):
         return "未命名"
     s = (name or "未命名").strip()
     s = s.replace("\u00a0", " ").replace("\u200b", "").replace("\u3000", " ")
+    # 去掉 NUL 及全部控制字符（书名混入 \x00 会让 open() 报 embedded null character）
+    s = "".join(ch for ch in s if ord(ch) >= 32 and ord(ch) != 0x7f)
     for c in ILLEGAL:
         s = s.replace(c, "_")
     while "  " in s:
@@ -242,7 +244,8 @@ def main():
         if os.path.exists(path):  # 书名碰撞：加短 ID 后缀保证唯一
             path = os.path.join(vault_kg, fn + "_" + str(bid)[:8] + ".md")
         with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
+            # 双保险：内容里若混有 NUL/控制字符（原始 title/publisher/summary 字段）一并剔除
+            f.write("\n".join(lines).replace("\x00", "").replace("\r", "") + "\n")
         C.mark_progress(pconn, bid, tool, "done")
         done += 1
         if i % 20 == 0:
