@@ -2409,17 +2409,28 @@ class H(http.server.SimpleHTTPRequestHandler):
             # 删除书籍 20260816：DB记录+关联+封面；上传的书删源文件目录，扫描导入的原始文件保留
             if path.startswith("/api/books/") and path.endswith("/delete"):
                 bid=path.split("/")[3]
-                if not dbq("SELECT id FROM books WHERE id=?",(bid,)): self.json({"error":"book not found"}); return
+                row=dbq("SELECT file_path FROM books WHERE id=?",(bid,))
+                if not row: self.json({"error":"book not found"}); return
+                fp=row[0].get('file_path') or ''
                 dbe("DELETE FROM book_authors WHERE book_id=?",(bid,))
                 dbe("DELETE FROM book_tags WHERE book_id=?",(bid,))
                 dbe("DELETE FROM book_categories WHERE book_id=?",(bid,))
                 dbe("DELETE FROM reading_notes WHERE book_id=?",(bid,))
+                dbe("DELETE FROM book_text WHERE id=?",(bid,))   # 补删全文(避免孤儿行)
                 dbe("DELETE FROM books WHERE id=?",(bid,))
                 try: os.remove(os.path.join("data","covers",bid+".jpg"))
                 except: pass
                 shutil.rmtree(os.path.join("data","books",bid), ignore_errors=True)
+                # 物理清除真实文件(file_path 指向的源文件或副本)
+                _fremoved=False
+                if fp and os.path.exists(fp):
+                    try:
+                        if os.path.isdir(fp): shutil.rmtree(fp, ignore_errors=True)
+                        else: os.remove(fp)
+                        _fremoved=True
+                    except: pass
                 _count_cache["time"]=0
-                self.json({"ok":True}); return
+                self.json({"ok":True,"removed_file": fp if _fremoved else None}); return
             # P2-A 阅读笔记 CRUD
             if path.startswith("/api/books/") and path.endswith("/note"):
                 bid=path.split("/")[3]; act=data.get('action','add')
@@ -3175,14 +3186,15 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             elif _tn_mode=='unchanged': _w+=" AND (normalized_title=title OR normalized_title='' OR normalized_title IS NULL)"
             elif _tn_mode=='upload': _w+=" AND normalized_title LIKE 'upload_%'"
             elif _tn_mode=='no_text': _w+=" AND (text_extracted=0 OR text_extracted IS NULL)"
+            elif _tn_mode=='corrupt': _w+=" AND file_format IN ('epub','mobi','azw3') AND (text_extracted=0 OR text_extracted IS NULL)"
             _tr=dbq("SELECT COUNT(*) AS c FROM books WHERE "+_w,_pa)[0]['c']
             _pages=max(1,( _tr+_tn_ps-1)//_tn_ps)
             _tn_page=max(1,min(_tn_page,_pages))
             _rows=dbq("SELECT id,title,normalized_title,file_format,text_extracted FROM books WHERE "+_w+" ORDER BY id LIMIT ? OFFSET ?",_pa+[_tn_ps,(_tn_page-1)*_tn_ps])
             h+='<div class=panel><p class=co>总书数 <b>'+str(_tot)+'</b> · 已被规则改写(存库) <b>'+str(_chg)+'</b> · 未变/无解回退 <b>'+str(_unc)+'</b> · 其中 upload_ 无解 <b>'+str(_up)+'</b> 本。 · 已抽正文 <b style="color:#52c41a">'+str(_ext)+'</b> 本 · 未抽 <b style="color:#fa8c16">'+str(_noext)+'</b> 本（扫描版/损坏/压缩包，详见下表「文本抽取」列）。</p>'
             h+='<p class=co>下表「规则化结果」为对<b>当前书名</b>实时套用 normalize_title() 规则所得（避免显示书名被后续补全更新造成的旧值漂移）。点「重算写回」(工具中心) 可把结果同步回 normalized_title 列。</p>'
-            h+='<form class=sch method=get style="margin:8px 0"><input type=hidden name=p value=title-norm>模式<select name=mode><option value=all'+(' selected' if _tn_mode=='all' else '')+'>全部</option><option value=changed'+(' selected' if _tn_mode=='changed' else '')+'>仅被改写</option><option value=unchanged'+(' selected' if _tn_mode=='unchanged' else '')+'>仅未变</option><option value=upload'+(' selected' if _tn_mode=='upload' else '')+'>仅 upload_ 无解</option><option value=no_text'+(' selected' if _tn_mode=='no_text' else '')+'>仅未抽正文</option></select> <input name=q placeholder="搜索书名" value="'+he(_tn_q)+'"><button>筛选</button></form>'
-            h+='<table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f3f3f3"><th style="border:1px solid #ddd;padding:6px;text-align:left"><input type=checkbox id=selAll onclick="selAll(this)" title="全选本页"></th><th style="border:1px solid #ddd;padding:6px;text-align:left">#</th><th style="border:1px solid #ddd;padding:6px;text-align:left">原书名（当前）</th><th style="border:1px solid #ddd;padding:6px;text-align:left">规则化结果</th><th style="border:1px solid #ddd;padding:6px;text-align:left">状态</th><th style="border:1px solid #ddd;padding:6px;text-align:left">文本抽取</th></tr>'
+            h+='<form class=sch method=get style="margin:8px 0"><input type=hidden name=p value=title-norm>模式<select name=mode><option value=all'+(' selected' if _tn_mode=='all' else '')+'>全部</option><option value=changed'+(' selected' if _tn_mode=='changed' else '')+'>仅被改写</option><option value=unchanged'+(' selected' if _tn_mode=='unchanged' else '')+'>仅未变</option><option value=upload'+(' selected' if _tn_mode=='upload' else '')+'>仅 upload_ 无解</option><option value=no_text'+(' selected' if _tn_mode=='no_text' else '')+'>仅未抽正文</option><option value=corrupt'+(' selected' if _tn_mode=='corrupt' else '')+'>仅损坏/空(电子书)</option></select> <input name=q placeholder="搜索书名" value="'+he(_tn_q)+'"><button>筛选</button></form>'
+            h+='<table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f3f3f3"><th style="border:1px solid #ddd;padding:6px;text-align:left"><input type=checkbox id=selAll onclick="selAll(this)" title="全选本页"></th><th style="border:1px solid #ddd;padding:6px;text-align:left">#</th><th style="border:1px solid #ddd;padding:6px;text-align:left">原书名（当前）</th><th style="border:1px solid #ddd;padding:6px;text-align:left">规则化结果</th><th style="border:1px solid #ddd;padding:6px;text-align:left">状态</th><th style="border:1px solid #ddd;padding:6px;text-align:left">文本抽取</th><th style="border:1px solid #ddd;padding:6px;text-align:left">操作</th></tr>'
             for _i,_r in enumerate(_rows):
                 _t=_r['title'] or ''
                 _nt=normalize_title(_t)
@@ -3197,9 +3209,9 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
                     elif _fm in ('epub','mobi','azw3'): _ext='<span style="color:#fa8c16">🟡 文件损坏/未抽</span>'
                     elif _fm in ('rar','zip','7z'): _ext='<span style="color:#1677ff">📦 压缩包</span>'
                     else: _ext='<span style="color:#888">⚪ 未抽</span>'
-                h+='<tr><td style="border:1px solid #ddd;padding:6px"><input type=checkbox class=rowcb name=bid value="'+he(str(_r['id']))+'"></td><td style="border:1px solid #ddd;padding:6px">'+str((_tn_page-1)*_tn_ps+_i+1)+'</td><td style="border:1px solid #ddd;padding:6px">'+he(_t)+'</td><td style="border:1px solid #ddd;padding:6px">'+he(_nt)+'</td><td style="border:1px solid #ddd;padding:6px">'+_st+'</td><td style="border:1px solid #ddd;padding:6px">'+_ext+'</td></tr>'
+                h+='<tr><td style="border:1px solid #ddd;padding:6px"><input type=checkbox class=rowcb name=bid value="'+he(str(_r['id']))+'"></td><td style="border:1px solid #ddd;padding:6px">'+str((_tn_page-1)*_tn_ps+_i+1)+'</td><td style="border:1px solid #ddd;padding:6px">'+he(_t)+'</td><td style="border:1px solid #ddd;padding:6px">'+he(_nt)+'</td><td style="border:1px solid #ddd;padding:6px">'+_st+'</td><td style="border:1px solid #ddd;padding:6px">'+_ext+'</td><td style="border:1px solid #ddd;padding:6px"><button class=btn style="padding:2px 6px;font-size:12px;background:#ff4d4f;color:#fff" onclick="DEL(\''+he(str(_r['id']))+'\')">🗑 删除</button></td></tr>'
             h+='</table>'
-            h+='<div style="margin:12px 0 4px"><label style="font-size:13px"><input type=checkbox id=selAll2 onclick="selAll(this)"> 全选本页</label> &nbsp; <button class=btn onclick="ADOPT()">✅ 采纳选中为正式书名</button> <span id=tnAdoptRes style="font-size:13px;color:#1677ff"></span></div>'
+            h+='<div style="margin:12px 0 4px"><label style="font-size:13px"><input type=checkbox id=selAll2 onclick="selAll(this)"> 全选本页</label> &nbsp; <button class=btn onclick="ADOPT()">✅ 采纳选中为正式书名</button> &nbsp; <button class=btn style="background:#ff4d4f;color:#fff" onclick="DELSEL()">🗑 删除选中</button> <span id=tnAdoptRes style="font-size:13px;color:#1677ff"></span> <span id=tnDelRes style="font-size:13px;color:#ff4d4f"></span></div>'
             h+='<p class=co>「采纳为正式书名」将把勾选书的 <b>title</b> 改为上表「规则化结果」（upload_ 无解的书自动跳过，不会误覆盖）。</p>'
             h+='<div class=pager style="margin:10px 0">'
             if _tn_page>1: h+='<a class=btn href="/?p=title-norm&page='+str(_tn_page-1)+('&mode='+_tn_mode if _tn_mode!='all' else '')+('&q='+urllib.parse.quote(_tn_q) if _tn_q else '')+'">上一页</a> '
@@ -3207,7 +3219,7 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             if _tn_page<_pages: h+='<a class=btn href="/?p=title-norm&page='+str(_tn_page+1)+('&mode='+_tn_mode if _tn_mode!='all' else '')+('&q='+urllib.parse.quote(_tn_q) if _tn_q else '')+'">下一页</a>'
             h+='</div>'
             h+='</div>'
-            h+='<script>function selAll(cb){document.querySelectorAll(".rowcb").forEach(function(x){x.checked=cb.checked;});}function ADOPT(){var ids=[];document.querySelectorAll(".rowcb:checked").forEach(function(x){ids.push(x.value);});var r=document.getElementById("tnAdoptRes");if(!ids.length){r.textContent="请先勾选至少一本";return;}if(!confirm("确认把选中的 "+ids.length+" 本书名采纳为正式书名？将覆盖当前 title。"))return;var x=new XMLHttpRequest();x.open("POST","/api/title-norm/adopt");x.setRequestHeader("Content-Type","application/json");x.onload=function(){try{var j=JSON.parse(x.responseText);r.textContent="已采纳 "+j.adopted+" 本，跳过 "+j.skipped+" 本（upload_无解不采纳）";setTimeout(function(){location.reload();},800);}catch(e){r.textContent="error";}};x.send(JSON.stringify({ids:ids}));}</script>'
+            h+='<script>function selAll(cb){document.querySelectorAll(".rowcb").forEach(function(x){x.checked=cb.checked;});}function ADOPT(){var ids=[];document.querySelectorAll(".rowcb:checked").forEach(function(x){ids.push(x.value);});var r=document.getElementById("tnAdoptRes");if(!ids.length){r.textContent="请先勾选至少一本";return;}if(!confirm("确认把选中的 "+ids.length+" 本书名采纳为正式书名？将覆盖当前 title。"))return;var x=new XMLHttpRequest();x.open("POST","/api/title-norm/adopt");x.setRequestHeader("Content-Type","application/json");x.onload=function(){try{var j=JSON.parse(x.responseText);r.textContent="已采纳 "+j.adopted+" 本，跳过 "+j.skipped+" 本（upload_无解不采纳）";setTimeout(function(){location.reload();},800);}catch(e){r.textContent="error";}};x.send(JSON.stringify({ids:ids}));}function DEL(bid){if(!confirm("确认删除这本书？将同时删除数据库记录与磁盘上的原文件，不可恢复！"))return;var x=new XMLHttpRequest();x.open("POST","/api/books/"+bid+"/delete");x.setRequestHeader("Content-Type","application/json");x.onload=function(){try{var j=JSON.parse(x.responseText);if(j.ok){alert("已删除");location.reload();}else alert("删除失败:"+(j.error||""));}catch(e){alert("error")}};x.send(JSON.stringify({}));}function DELSEL(){var ids=[];document.querySelectorAll(".rowcb:checked").forEach(function(x){ids.push(x.value);});var r=document.getElementById("tnDelRes");if(!ids.length){r.textContent="请先勾选至少一本";return;}if(!confirm("确认删除选中的 "+ids.length+" 本书？将同时删除数据库记录与磁盘原文件，不可恢复！"))return;var n=0;function nx(){if(n>=ids.length){r.textContent="已删除 "+ids.length+" 本";setTimeout(function(){location.reload();},600);return;}var x=new XMLHttpRequest();x.open("POST","/api/books/"+ids[n]+"/delete");x.setRequestHeader("Content-Type","application/json");x.onload=function(){n++;nx();};x.onerror=function(){n++;nx();};x.send(JSON.stringify({}));}nx();}</script>'
         else:
             ts=ct.get('ts',0); import_rem=ct.get('import_rem',0); sum_rem=ct.get('sum_rem',0); no_text=ct.get('no_text',0)
             _ld=""
