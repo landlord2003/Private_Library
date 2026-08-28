@@ -31,13 +31,15 @@ def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     con = sqlite3.connect(DB, timeout=30)
     if mode == "ocr":
-        # OCR 重跑模式：仅重抽「已抽过(text_extracted=1)但正文极短(<=200字,疑似书名兜底)」的 PDF。
+        # OCR 重跑模式：重抽「回落空壳(text_extracted=0/NULL)或正文极短(<=200字,疑似书名兜底)」的 PDF。
         # 适用场景：装好 tesseract+chi_sim 后，把之前因无 OCR 而回落书名的扫描版 PDF 重新识别。
+        # 关键修正：回落空壳时 _title_fallback 把 text_extracted 置为 0(非空壳标题行),故必须包含 text_extracted=0，
+        #          否则那些书永远不在候选里、OCR 补不回来。
         # 注意：>50MB 大文件在 extract_text_for 内仍走跳过逻辑(不 OCR)，故超大扫描版需另行处理。
         q = """SELECT b.id,b.file_path,b.file_format FROM books b
                JOIN book_text bt ON bt.id=b.id
                WHERE b.status='active' AND b.file_format='pdf'
-                 AND b.text_extracted=1 AND length(bt.text_content)<=200"""
+                 AND (b.text_extracted=0 OR b.text_extracted IS NULL OR length(bt.text_content)<=200)"""
         L("[mode] ocr-rerun: 仅重抽疑似书名兜底的扫描版PDF(正文<=200字)")
     else:
         # 仅按 text_extracted 标志筛选：text_extracted=1 的书必有真实正文，其余(text_extracted=0/NULL)都需(重)抽取。
