@@ -347,7 +347,8 @@ def _openlibrary_meta(title, author=None, isbn=None, detail=True):
                     best_sim = sm
                     best = d
                     wk_key = d.get("key")
-            break
+            if best_sim >= 0.9:
+                break
     if not best:
         return None
     pub = ""; pd = ""; lang = ""; isbn2 = ""; desc = ""
@@ -411,11 +412,11 @@ def _openlibrary_meta(title, author=None, isbn=None, detail=True):
 
 
 _google_cooldown_until = 0.0
+_douban_cooldown_until = 0.0
 
 
 def fetch_online_metadata(title, author=None, isbn=None, normalized_title=None, detail=True):
-    """在线补全单本元数据。主源 Open Library（直连无需代理）；Google Books 补充（中文覆盖较好）；
-    豆瓣仅在配置 LIB_PROXY 时兜底（直连全 403，默认不调用以免淹没无效请求）。"""
+    """在线补全单本元数据。主源 Open Library（直连）→ Google Books 补充 → 豆瓣直连兜底（中文覆盖最好，遇403冷却）。"""
     global _google_cooldown_until
     q = (normalized_title or "").strip() or (title or "").strip()
     if not q and not isbn:
@@ -471,8 +472,9 @@ def fetch_online_metadata(title, author=None, isbn=None, normalized_title=None, 
                 print(f"[GB 429 冷却] {title[:20]}: 2分钟内跳过 Google", flush=True)
             else:
                 print(f"[GB失败] {title[:30]}: {e}", flush=True)
-    # 2) 豆瓣（仅当配置 LIB_PROXY；直连全 403，默认不调用以免淹没无效请求）
-    if detail and os.environ.get("LIB_PROXY"):
+    # 2) 豆瓣（直连；本机实测可访问，中文书覆盖远好于 OL；遇 403 冷却避免被封）
+    global _douban_cooldown_until
+    if detail and time.time() > _douban_cooldown_until:
         try:
             dm = _douban_meta(q, author, isbn, detail=detail)
             if dm and dm.get("sim", 0) >= 0.5:
@@ -480,11 +482,17 @@ def fetch_online_metadata(title, author=None, isbn=None, normalized_title=None, 
                 for k in ("publisher", "publish_date", "isbn", "language", "description"):
                     if not merged.get(k) and dm.get(k):
                         merged[k] = dm[k]
-                merged["source"] = (merged.get("source", "") + "+douban").strip("+")
+                merged["source"] = (merged.get("source", "") + "+douban").strip("+") or "douban"
                 merged["sim"] = max(dm.get("sim", 0), best_sim)
                 result = merged
+                best_sim = merged.get("sim", 0)
         except Exception as e:
-            print(f"[豆瓣失败] {q[:30]}: {e}", flush=True)
+            msg = str(e)
+            if "403" in msg:
+                _douban_cooldown_until = time.time() + 120
+                print(f"[豆瓣403冷却] {q[:20]}: 2分钟内跳过豆瓣", flush=True)
+            else:
+                print(f"[豆瓣失败] {q[:30]}: {e}", flush=True)
     return result
 
 
