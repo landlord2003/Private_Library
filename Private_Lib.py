@@ -800,6 +800,27 @@ function editMediaTitle(mid,oldTitle){
 }
 function EDTM(mid){var t=prompt("新名称:");if(t&&t.trim()){var x=new XMLHttpRequest();x.open("POST","/api/media/"+mid+"/edit");x.setRequestHeader("Content-Type","application/json");x.onload=function(){location.reload()};x.send(JSON.stringify({title:t.trim()}));}}
 
+// 单本生成摘要（详情页「🤖 生成摘要」按钮）20260828
+function GENSUMMARY(id){
+  var btn=document.getElementById('gen-sum-btn');
+  var msg=document.getElementById('gen-sum-msg');
+  if(btn){btn.disabled=true;btn.textContent='⏳ 生成中…';}
+  if(msg)msg.textContent='正在调用本机 Ollama 生成摘要（CPU 约数十秒，请稍候）…';
+  var x=new XMLHttpRequest();x.open("POST","/api/books/"+id+"/summary");x.setRequestHeader("Content-Type","application/json");
+  x.onload=function(){
+    try{var r=JSON.parse(x.responseText);
+      if(r.ok){var body=document.getElementById('summary-body');
+        if(body){body.removeAttribute('class');body.setAttribute('style','white-space:pre-wrap;line-height:1.8;background:#f9f9f9;padding:16px;border-radius:8px;margin-top:8px');body.textContent=r.summary;}
+        if(msg)msg.textContent='✅ 已生成（'+r.model+'）';
+        if(btn)btn.textContent='🤖 重新生成';
+      }else{if(msg)msg.textContent='❌ '+r.error;if(btn)btn.textContent='🤖 生成摘要';}
+    }catch(e){if(msg)msg.textContent='❌ 响应解析失败';if(btn)btn.textContent='🤖 生成摘要';}
+    if(btn)btn.disabled=false;
+  };
+  x.onerror=function(){if(msg)msg.textContent='❌ 网络错误';if(btn){btn.disabled=false;btn.textContent='🤖 生成摘要';}};
+  x.send("{}");
+}
+
 // 删除书籍/媒体 20260816
 function DELB(id,title){
   if(!confirm("⚠️ 确定要删除这本书吗？\\n\\n《"+title+"》\\n\\n将删除：书籍记录、AI 摘要、分类/标签/作者关联、阅读笔记、封面。\\n注：网页上传的书会连源文件一起删除；磁盘扫描导入的原始文件会保留。\\n\\n此操作不可恢复！"))return;
@@ -2505,6 +2526,31 @@ class H(http.server.SimpleHTTPRequestHandler):
                     except: pass
                 _count_cache["time"]=0
                 self.json({"ok":True,"removed_file": fp if _fremoved else None}); return
+            # 单本生成摘要（详情页「🤖 生成摘要」按钮调用）20260828
+            if path.startswith("/api/books/") and path.endswith("/summary"):
+                bid=path.split("/")[3]
+                row=dbq("SELECT id,title FROM books WHERE id=?",(bid,))
+                if not row: self.json({"error":"book not found"}); return
+                b=row[0]
+                t=dbq("SELECT text_content FROM book_text WHERE id=?",(bid,))
+                txt = t[0]['text_content'] if (t and t[0]['text_content']) else ''
+                if len(txt.strip())<20:
+                    self.json({"error":"本书无足够正文，无法生成摘要（正文仅 %d 字）。如是短垃圾文本建议直接删除本书。" % len(txt.strip())}); return
+                try:
+                    prompt=f"你是专业图书摘要助手。书名：{b['title']}\n内容：{txt[:2000]}\n按以下结构输出（中文）：\n1. 一句话总结\n2. 核心观点（3-5条）\n3. 关键概念\n4. 适合读者\n5. 难度评级：入门/中级/高级"
+                    s=_ollama_generate(prompt, model="qwen2.5:7b", timeout=300, temperature=0.3, num_ctx=4096)
+                except OllamaError as e:
+                    self.json({"error":"Ollama 调用失败: %s" % str(e)}); return
+                except Exception as e:
+                    self.json({"error":"摘要生成异常: %s" % str(e)[:200]}); return
+                if len(s)<=20:
+                    self.json({"error":"模型返回内容过短，未生成有效摘要"}); return
+                dbe("UPDATE books SET summary=?,summary_model=?,summary_updated=datetime('now') WHERE id=?",(s,"qwen2.5:7b",bid))
+                if "高级" in s: dbe("UPDATE books SET difficulty='高级' WHERE id=? AND difficulty IS NULL",(bid,))
+                elif "中级" in s: dbe("UPDATE books SET difficulty='中级' WHERE id=? AND difficulty IS NULL",(bid,))
+                elif "入门" in s: dbe("UPDATE books SET difficulty='入门' WHERE id=? AND difficulty IS NULL",(bid,))
+                _count_cache["time"]=0
+                self.json({"ok":True,"summary":s,"model":"qwen2.5:7b"}); return
             # P2-A 阅读笔记 CRUD
             if path.startswith("/api/books/") and path.endswith("/note"):
                 bid=path.split("/")[3]; act=data.get('action','add')
@@ -3067,8 +3113,11 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
                     if b['difficulty']:
                         dc={'入门':'#52c41a','中级':'#fa8c16','高级':'#ff4d4f'}
                         h+=' <span class=tag style=background:'+dc.get(b['difficulty'],'#999')+'>难度: '+b['difficulty']+'</span>'
-                    if b['summary']:h+='<div class=sec><h3>🤖 AI 摘要</h3><div style=white-space:pre-wrap;line-height:1.8;background:#f9f9f9;padding:16px;border-radius:8px;margin-top:8px>'+he(str(b['summary']))+'</div></div>'
-                    else:h+='<div class=sec><p class=co>暂无摘要</p></div>'
+                    # AI 摘要区块 + 单本「生成摘要」按钮（不重载页面，就地注入）20260828
+                    h+='<div class=sec><h3>🤖 AI 摘要 <button class="btn" id="gen-sum-btn" onclick="GENSUMMARY(\''+bid+'\')" style="font-size:12px;padding:2px 8px;background:#1677ff;color:#fff;margin-left:6px;vertical-align:middle">🤖 生成摘要</button> <span id="gen-sum-msg" class=co></span></h3>'
+                    if b['summary']:h+='<div id="summary-body" style=white-space:pre-wrap;line-height:1.8;background:#f9f9f9;padding:16px;border-radius:8px;margin-top:8px>'+he(str(b['summary']))+'</div>'
+                    else:h+='<p class=co id="summary-body">暂无摘要</p>'
+                    h+='</div>'
                     # P2-A 阅读笔记
                     h+='<div class=sec id=notes-sec><h3>📝 阅读笔记</h3><div id=notes-list data-bid="'+bid+'"></div>'
                     h+='<div style="margin-top:10px"><textarea id=note-input placeholder="写点笔记…（可选填页码）" style="width:100%;min-height:60px;padding:8px;border:1px solid var(--border2);border-radius:6px;font-family:inherit;font-size:14px;background:var(--panel);color:var(--text)"></textarea>'
