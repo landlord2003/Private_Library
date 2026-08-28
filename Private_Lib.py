@@ -2493,7 +2493,7 @@ def run_transcribe_retry_async(count=50):
             media_list = dbq(
                 "SELECT id,title,file_path,media_type FROM media WHERE status='active' "
                 "AND transcript IS NOT NULL AND (transcript LIKE '[转录失败%' OR transcript LIKE '[转录超时%' "
-                "OR transcript='[文件不存在]' OR transcript LIKE '[分段转录失败%') "
+                "OR transcript='[文件不存在]' OR transcript LIKE '[分段转录失败%' OR transcript LIKE '[文件时长%') "
                 "ORDER BY updated_at ASC LIMIT ?", (int(count),))
             rv = {"done":0,"total":len(media_list),"current":"","error_count":0}
             for m in media_list:
