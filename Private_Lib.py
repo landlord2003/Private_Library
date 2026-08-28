@@ -134,7 +134,8 @@ def _tool_run(data):
         else:
             cmd = [py, os.path.join(td, "meta_complete.py"), "--mode", (d.get('mode') or 'fast'), "--limit", str(lim)]
     elif tool == 'summary':
-        cmd = [py, os.path.join(td, "summary_fix.py"), "--mode", "all", "--limit", str(lim)]
+        # 原 summary_fix.py 已不存在；改为内联智能跑批(假摘要先修、再补缺失)，与首页 AI 摘要同源
+        return run_summary_smart_async(lim)
     else:
         return {"ok": False, "msg": "未知工具: " + str(tool)}
     if _tool_procs.get(tool) and _tool_procs[tool].poll() is None:
@@ -254,7 +255,7 @@ def _tool_center_html():
         '模式<select id=metaMode><option value=fast>fast</option><option value=full>full</option></select> <input id=metaLimit value=200 style="width:70px"> <button class=btn onclick="TR(\'meta\',false)">▶ 跑一批</button> <button class=btn onclick="TR(\'meta\',true)">🔁 重试失败</button> <span id=metaRes></span>')
     sm = tools.get('summary',{})
     h += card('✏️','摘要修复',
-        '清掉 %d 条「假摘要」(导入时无正文被 LLM 编的模板示例)，用真全文经本机 Ollama 重跑真摘要。需 Ollama 在线。' % fake,
+        '智能摘要跑批：先修 %d 条「假摘要」(有正文重跑真摘要/无正文清空)，再补真正缺失的摘要；无正文的书标「无正文不可摘」跳过。需 Ollama 在线。' % fake,
         '待修 %d 本 · 已完成 %d 本 · %s' % (fake, sm.get('done',0), '🟢运行中' if sm.get('running') else '⚪空闲'),
         max(0, fake), '#c0392b', '/?p=stats', '查看摘要健康',
         '<span id=sumPending style="color:#c0392b;font-size:12px"></span><br><input id=sumLimit value=20000 style="width:80px"> <button class=btn onclick="TR(\'summary\',false)">▶ 跑一批</button> <button class=btn onclick="TR(\'summary\',false,20000)">🔥 全量修复</button> <span id=sumRes></span>')
@@ -1566,6 +1567,68 @@ def run_summarize_async(count=3):
     threading.Thread(target=w,daemon=True).start()
     return {"status":"started"}
 
+def run_summary_smart_async(limit=200):
+    """智能摘要跑批（升级自 run_summarize_async 的裸生成）：
+    阶段1 直接处理已有假摘要——有正文则经本机 Ollama 重跑真摘要，无正文则清空(不再冒充有摘要)；
+    阶段2 再为「真正有正文但无真摘要」的书生成摘要；
+    无正文且无情真摘要的书标注为「无正文不可摘」，自动跳过(避免反复编假摘要)。
+    limit 约束两阶段合计处理量。需 Ollama 在线。"""
+    if _task_status.get('sr'): return {"status":"running"}
+    _task_status['sr'] = True
+    _task_status['sr_r'] = {"done":0,"total":0,"fake_fixed":0,"fake_cleared":0,"generated":0,"no_text":0}
+    def _diff(bid, s):
+        if "高级" in s: dbe("UPDATE books SET difficulty='高级' WHERE id=? AND difficulty IS NULL",(bid,))
+        elif "中级" in s: dbe("UPDATE books SET difficulty='中级' WHERE id=? AND difficulty IS NULL",(bid,))
+        elif "入门" in s: dbe("UPDATE books SET difficulty='入门' WHERE id=? AND difficulty IS NULL",(bid,))
+    def w():
+        try:
+            rv={"done":0,"total":0,"fake_fixed":0,"fake_cleared":0,"generated":0,"no_text":0}
+            lim=int(limit)
+            # 阶段1：已有假摘要（直接处理）
+            fakes=dbq("SELECT id,summary FROM books WHERE status='active' AND summary IS NOT NULL AND summary<>''")
+            fake_ids=[r['id'] for r in fakes if _is_fake_summary(r['summary'])]
+            rv["total"]=len(fake_ids)
+            for bid in fake_ids:
+                if rv["done"]>=lim: break
+                try:
+                    t=dbq("SELECT text_content FROM book_text WHERE id=?",(bid,))
+                    has_text = t and t[0]['text_content'] and len(t[0]['text_content'].strip())>=50
+                    if has_text:
+                        title=dbq("SELECT title FROM books WHERE id=?",(bid,))[0]['title']
+                        prompt=f"你是专业图书摘要助手。书名：{title}\n内容：{t[0]['text_content'][:2000]}\n按以下结构输出（中文）：\n1. 一句话总结\n2. 核心观点（3-5条）\n3. 关键概念\n4. 适合读者\n5. 难度评级：入门/中级/高级"
+                        s=_ollama_generate(prompt, model="qwen2.5:7b", timeout=300, temperature=0.3, num_ctx=4096)
+                        if len(s)>20:
+                            dbe("UPDATE books SET summary=?,summary_model=?,summary_updated=datetime('now') WHERE id=?",(s,"qwen2.5:7b",bid))
+                            _diff(bid,s); rv["fake_fixed"]+=1
+                        else:
+                            dbe("UPDATE books SET summary=NULL,summary_model=NULL WHERE id=?",(bid,)); rv["fake_cleared"]+=1
+                    else:
+                        dbe("UPDATE books SET summary=NULL,summary_model=NULL WHERE id=?",(bid,)); rv["fake_cleared"]+=1
+                    rv["done"]+=1; _task_status['sr_r']=rv
+                except Exception as e:
+                    print(f"[摘要修复异常] {bid}: {type(e).__name__}: {e}",flush=True)
+            # 阶段2：真正有正文但无真摘要
+            remain=lim-rv["done"]
+            if remain>0:
+                miss=dbq("SELECT b.id,b.title,t.text_content FROM books b JOIN book_text t ON t.id=b.id WHERE b.status='active' AND b.text_extracted=1 AND (b.summary IS NULL OR b.summary='') LIMIT ?",(remain,))
+                rv["total"]+=len(miss)
+                for b in miss:
+                    try:
+                        prompt=f"你是专业图书摘要助手。书名：{b['title']}\n内容：{(b['text_content'] or '')[:2000]}\n按以下结构输出（中文）：\n1. 一句话总结\n2. 核心观点（3-5条）\n3. 关键概念\n4. 适合读者\n5. 难度评级：入门/中级/高级"
+                        s=_ollama_generate(prompt, model="qwen2.5:7b", timeout=300, temperature=0.3, num_ctx=4096)
+                        if len(s)>20:
+                            dbe("UPDATE books SET summary=?,summary_model=?,summary_updated=datetime('now') WHERE id=?",(s,"qwen2.5:7b",b['id']))
+                            _diff(b['id'],s); rv["generated"]+=1
+                        rv["done"]+=1; _task_status['sr_r']=rv
+                    except Exception as e:
+                        print(f"[摘要异常] {b['title'][:30]}: {type(e).__name__}: {e}",flush=True)
+            _task_status['sr_r']=rv
+        finally:
+            _task_status['sr']=False
+            _count_cache["time"]=0
+    threading.Thread(target=w,daemon=True).start()
+    return {"status":"started"}
+
 # ==================== 在线元数据补全（功能化整合，零依赖 urllib） ====================
 def _clean_title(t):
     """清洗书名噪声用于相似度比对，避免‘全集/套装/插图版’等干扰匹配。"""
@@ -1742,6 +1805,17 @@ def _is_fake_summary(s):
     if any(m in s for m in _FAKE_EXACT):
         return True
     return False
+
+
+def _summary_tag(s, te):
+    """书名规则化列表用的「摘要」状态标注（满足『无真摘要的你标注一下』）。"""
+    if s and str(s).strip() and not _is_fake_summary(s):
+        return '<span style="color:#52c41a">✅ 真摘要</span>'
+    if s and str(s).strip() and _is_fake_summary(s):
+        return '<span style="color:#fa8c16">🟡 假摘要</span>'
+    if te == 1:
+        return '<span style="color:#888">⚪ 无摘要</span>'
+    return '<span style="color:#ff4d4f">🚫 无正文不可摘</span>'
 
 
 def _summary_fix_pending():
@@ -2370,7 +2444,7 @@ class H(http.server.SimpleHTTPRequestHandler):
                 if title: dbe("UPDATE books SET title=? WHERE id=?",(title,bid)); self.json({"ok":True,"title":title})
                 else: self.json({"error":"title empty"}); return
             if path == "/api/classify-batch": self.json(run_classify_async(data.get('count',10))); return
-            if path == "/api/summarize-batch": self.json(run_summarize_async(data.get('count',3))); return
+            if path == "/api/summarize-batch": self.json(run_summary_smart_async(data.get('count',3))); return
             if path == "/api/metadata-batch": self.json(run_metadata_async(data.get('count') or None)); return
             if path == "/api/extract-batch": self.json(run_extract_async(data.get('count',10))); return
             if path == "/api/extract-ocr": self.json(run_extract_ocr_async()); return
@@ -3190,11 +3264,11 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             _tr=dbq("SELECT COUNT(*) AS c FROM books WHERE "+_w,_pa)[0]['c']
             _pages=max(1,( _tr+_tn_ps-1)//_tn_ps)
             _tn_page=max(1,min(_tn_page,_pages))
-            _rows=dbq("SELECT id,title,normalized_title,file_format,text_extracted FROM books WHERE "+_w+" ORDER BY id LIMIT ? OFFSET ?",_pa+[_tn_ps,(_tn_page-1)*_tn_ps])
+            _rows=dbq("SELECT id,title,normalized_title,file_format,text_extracted,summary FROM books WHERE "+_w+" ORDER BY id LIMIT ? OFFSET ?",_pa+[_tn_ps,(_tn_page-1)*_tn_ps])
             h+='<div class=panel><p class=co>总书数 <b>'+str(_tot)+'</b> · 已被规则改写(存库) <b>'+str(_chg)+'</b> · 未变/无解回退 <b>'+str(_unc)+'</b> · 其中 upload_ 无解 <b>'+str(_up)+'</b> 本。 · 已抽正文 <b style="color:#52c41a">'+str(_ext)+'</b> 本 · 未抽 <b style="color:#fa8c16">'+str(_noext)+'</b> 本（扫描版/损坏/压缩包，详见下表「文本抽取」列）。</p>'
             h+='<p class=co>下表「规则化结果」为对<b>当前书名</b>实时套用 normalize_title() 规则所得（避免显示书名被后续补全更新造成的旧值漂移）。点「重算写回」(工具中心) 可把结果同步回 normalized_title 列。</p>'
             h+='<form class=sch method=get style="margin:8px 0"><input type=hidden name=p value=title-norm>模式<select name=mode><option value=all'+(' selected' if _tn_mode=='all' else '')+'>全部</option><option value=changed'+(' selected' if _tn_mode=='changed' else '')+'>仅被改写</option><option value=unchanged'+(' selected' if _tn_mode=='unchanged' else '')+'>仅未变</option><option value=upload'+(' selected' if _tn_mode=='upload' else '')+'>仅 upload_ 无解</option><option value=no_text'+(' selected' if _tn_mode=='no_text' else '')+'>仅未抽正文</option><option value=corrupt'+(' selected' if _tn_mode=='corrupt' else '')+'>仅损坏/空(电子书)</option></select> <input name=q placeholder="搜索书名" value="'+he(_tn_q)+'"><button>筛选</button></form>'
-            h+='<table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f3f3f3"><th style="border:1px solid #ddd;padding:6px;text-align:left"><input type=checkbox id=selAll onclick="selAll(this)" title="全选本页"></th><th style="border:1px solid #ddd;padding:6px;text-align:left">#</th><th style="border:1px solid #ddd;padding:6px;text-align:left">原书名（当前）</th><th style="border:1px solid #ddd;padding:6px;text-align:left">规则化结果</th><th style="border:1px solid #ddd;padding:6px;text-align:left">状态</th><th style="border:1px solid #ddd;padding:6px;text-align:left">文本抽取</th><th style="border:1px solid #ddd;padding:6px;text-align:left">操作</th></tr>'
+            h+='<table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f3f3f3"><th style="border:1px solid #ddd;padding:6px;text-align:left"><input type=checkbox id=selAll onclick="selAll(this)" title="全选本页"></th><th style="border:1px solid #ddd;padding:6px;text-align:left">#</th><th style="border:1px solid #ddd;padding:6px;text-align:left">原书名（当前）</th><th style="border:1px solid #ddd;padding:6px;text-align:left">规则化结果</th><th style="border:1px solid #ddd;padding:6px;text-align:left">状态</th><th style="border:1px solid #ddd;padding:6px;text-align:left">文本抽取</th><th style="border:1px solid #ddd;padding:6px;text-align:left">摘要</th><th style="border:1px solid #ddd;padding:6px;text-align:left">操作</th></tr>'
             for _i,_r in enumerate(_rows):
                 _t=_r['title'] or ''
                 _nt=normalize_title(_t)
@@ -3209,7 +3283,8 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
                     elif _fm in ('epub','mobi','azw3'): _ext='<span style="color:#fa8c16">🟡 文件损坏/未抽</span>'
                     elif _fm in ('rar','zip','7z'): _ext='<span style="color:#1677ff">📦 压缩包</span>'
                     else: _ext='<span style="color:#888">⚪ 未抽</span>'
-                h+='<tr><td style="border:1px solid #ddd;padding:6px"><input type=checkbox class=rowcb name=bid value="'+he(str(_r['id']))+'"></td><td style="border:1px solid #ddd;padding:6px">'+str((_tn_page-1)*_tn_ps+_i+1)+'</td><td style="border:1px solid #ddd;padding:6px">'+he(_t)+'</td><td style="border:1px solid #ddd;padding:6px">'+he(_nt)+'</td><td style="border:1px solid #ddd;padding:6px">'+_st+'</td><td style="border:1px solid #ddd;padding:6px">'+_ext+'</td><td style="border:1px solid #ddd;padding:6px"><button class=btn style="padding:2px 6px;font-size:12px;background:#ff4d4f;color:#fff" onclick="DEL(\''+he(str(_r['id']))+'\')">🗑 删除</button></td></tr>'
+                _sm=_summary_tag(_r.get('summary'), _te)
+                h+='<tr><td style="border:1px solid #ddd;padding:6px"><input type=checkbox class=rowcb name=bid value="'+he(str(_r['id']))+'"></td><td style="border:1px solid #ddd;padding:6px">'+str((_tn_page-1)*_tn_ps+_i+1)+'</td><td style="border:1px solid #ddd;padding:6px">'+he(_t)+'</td><td style="border:1px solid #ddd;padding:6px">'+he(_nt)+'</td><td style="border:1px solid #ddd;padding:6px">'+_st+'</td><td style="border:1px solid #ddd;padding:6px">'+_ext+'</td><td style="border:1px solid #ddd;padding:6px">'+_sm+'</td><td style="border:1px solid #ddd;padding:6px"><a href="/?p=detail&id='+he(str(_r['id']))+'" class=btn style="padding:2px 6px;font-size:12px" target=_blank>🔍 详情</a> <button class=btn style="padding:2px 6px;font-size:12px;background:#ff4d4f;color:#fff" onclick="DEL(\''+he(str(_r['id']))+'\')">🗑 删除</button></td></tr>'
             h+='</table>'
             h+='<div style="margin:12px 0 4px"><label style="font-size:13px"><input type=checkbox id=selAll2 onclick="selAll(this)"> 全选本页</label> &nbsp; <button class=btn onclick="ADOPT()">✅ 采纳选中为正式书名</button> &nbsp; <button class=btn style="background:#ff4d4f;color:#fff" onclick="DELSEL()">🗑 删除选中</button> <span id=tnAdoptRes style="font-size:13px;color:#1677ff"></span> <span id=tnDelRes style="font-size:13px;color:#ff4d4f"></span></div>'
             h+='<p class=co>「采纳为正式书名」将把勾选书的 <b>title</b> 改为上表「规则化结果」（upload_ 无解的书自动跳过，不会误覆盖）。</p>'
@@ -3225,7 +3300,7 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             _ld=""
             h+='<h2>🏠 首页</h2>'
             h+='<div class=row><a href="/?p=books" class=sb><div class=n style=color:#1677ff>'+str(tb)+'</div><div class=l>📚 书籍</div></a><a href="/?p=detail&list=1" class=sb><div class=n style=color:#52c41a>'+str(ts)+'</div><div class=l>🤖 已摘要</div></a><a href="/?p=media" class=sb><div class=n style=color:#fa8c16>'+str(tm)+'</div><div class=l>🎧 媒体</div></a><a href="/?p=media_transcribed" class=sb><div class=n style=color:#13c2c2>'+str(ct.get("mtr",0))+'</div><div class=l>🎙️ 已转录</div></a><a href="/?p=media_summarized" class=sb><div class=n style=color:#eb2f96>'+str(ct.get("msu",0))+'</div><div class=l>📝 媒体摘要</div></a></div>'
-            h+='<div class=panel><h3>🤖 AI 处理</h3><p class=co style=margin-bottom:8px>未分类: '+str(import_rem)+' 本 | 未摘要: '+str(sum_rem)+' 本 | 无文本: '+str(no_text)+' 本'+_ld+'</p>'
+            h+='<div class=panel><h3>🤖 AI 处理</h3><p class=co style=margin-bottom:8px>未分类: '+str(import_rem)+' 本 | 未摘要: '+str(sum_rem)+' 本 | 无文本: '+str(no_text)+' 本'+_ld+' ｜ 🤖 AI 摘要已升级为智能跑批：先修「假摘要」(有正文重跑/无正文清空)再补真正缺失的，无正文自动跳过</p>'
             h+='<div style="margin-bottom:8px"><label style=font-size:13px>分类数量 </label><select id=clsCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=5>5 本</option><option value=10 selected>10 本</option><option value=20>20 本</option><option value=50>50 本</option><option value=100>100 本</option><option value=500>500 本</option><option value=1000>1000 本</option></select> <button class=btn id=clsBtn onclick="CLS()" style=margin-right:8px>🤖 AI 分类</button></div>'
             h+='<div style="margin-bottom:8px"><label style=font-size:13px>摘要数量 </label><select id=sumCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=1>1 本</option><option value=3 selected>3 本</option><option value=5>5 本</option><option value=10>10 本</option><option value=20>20 本</option><option value=100>100 本</option><option value=500>500 本</option><option value=1000>1000 本</option></select> <button class=btn id=sumBtn onclick="SUM()">🤖 AI 摘要</button></div>'
             h+='<div><label style=font-size:13px>提取数量 </label><select id=extCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=5>5 本</option><option value=10 selected>10 本</option><option value=20>20 本</option><option value=50>50 本</option><option value=100>100 本</option><option value=500>500 本</option><option value=1000>1000 本</option></select> <button class=btn id=extBtn onclick="EXT()">📄 提取文本</button></div>'
