@@ -103,6 +103,7 @@ def main():
     rv = {"filled": 0, "skip": 0, "partial": 0}
     t0 = time.time()
     for i, b in enumerate(rows, 1):
+        b = dict(b)
         bid = b["id"]
         norm = b["normalized_title"] or ""
         try:
