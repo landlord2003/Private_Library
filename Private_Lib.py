@@ -800,6 +800,52 @@ function _pollMsu(){
 }
 
 //媒体转录、摘要前端20260801结束
+var _trsRTimer=null;
+function TRSR(){
+  var b=document.getElementById("trsRBtn");if(b.disabled)return;
+  b.disabled=true;b.textContent="重试启动中...";
+  document.getElementById("trsRRes").innerHTML="启动中，重试历史失败/跳过的转录...";
+  var x=new XMLHttpRequest();x.open("POST","/api/media/transcribe-retry");x.setRequestHeader("Content-Type","application/json");
+  x.onload=function(){b.disabled=false;b.textContent="🔁 重试失败转录";_pollTrsR();};
+  x.send(JSON.stringify({count:50}))
+}
+function _pollTrsR(){
+  clearTimeout(_trsRTimer);
+  var x=new XMLHttpRequest();x.open("GET","/api/task-status");
+  x.onload=function(){
+    var r=JSON.parse(x.responseText);var t=r.transcribe_retry||{};
+    if(t.total>0){
+      document.getElementById("trsRRes").innerHTML="重试转录中: "+t.done+"/"+t.total+(t.error_count?(" (失败 "+t.error_count+")"):"");
+      if(t.done<t.total)_trsRTimer=setTimeout(_pollTrsR,3000);
+      else document.getElementById("trsRRes").innerHTML="✅ 重试完成: "+t.done+" 个 <a href=/ onclick=location.reload()>刷新</a>";
+    }else{_trsRTimer=setTimeout(_pollTrsR,3000);}
+  };
+  x.onerror=function(){_trsRTimer=setTimeout(_pollTrsR,5000);};
+  x.send()
+}
+var _mslTimer=null;
+function MSUL(){
+  var b=document.getElementById("mslBtn");if(b.disabled)return;
+  b.disabled=true;b.textContent="重摘要启动中...";
+  document.getElementById("mslRes").innerHTML="启动中，对超长转录做分块摘要...";
+  var x=new XMLHttpRequest();x.open("POST","/api/media/summarize-long");x.setRequestHeader("Content-Type","application/json");
+  x.onload=function(){b.disabled=false;b.textContent="🔁 重摘要超长媒体(>8000字)";_pollMsl();};
+  x.send(JSON.stringify({count:200}))
+}
+function _pollMsl(){
+  clearTimeout(_mslTimer);
+  var x=new XMLHttpRequest();x.open("GET","/api/task-status");
+  x.onload=function(){
+    var r=JSON.parse(x.responseText);var s=r.media_resummarize_long||{};
+    if(s.total>0){
+      document.getElementById("mslRes").innerHTML="重摘要中: "+s.done+"/"+s.total+(s.error_count?(" (失败 "+s.error_count+")"):"");
+      if(s.done<s.total)_mslTimer=setTimeout(_pollMsl,3000);
+      else document.getElementById("mslRes").innerHTML="✅ 重摘要完成: "+s.done+" 个 <a href=/ onclick=location.reload()>刷新</a>";
+    }else{_mslTimer=setTimeout(_pollMsl,3000);}
+  };
+  x.onerror=function(){_mslTimer=setTimeout(_pollMsl,5000);};
+  x.send()
+}
 function editMediaTitle(mid,oldTitle){
   var t=prompt("新名称:",oldTitle);if(!t||t.trim()===''||t.trim()===oldTitle)return;
   var x=new XMLHttpRequest();x.open("POST","/api/media/"+mid+"/edit");x.setRequestHeader("Content-Type","application/json");
@@ -2204,8 +2250,43 @@ def get_audio_duration(file_path):
     except:
         return 0
 
+def _transcribe_segments(model, audio_path, chunk_sec=1200, lang="zh"):
+    """分段转录长音频：用 ffmpeg 切成 <=chunk_sec 秒的小段，逐段 faster-whisper 识别后拼接。
+
+    解除 transcribe_file 原 >2h 硬上限，使超长音视频也能完整转录（修复「超过2小时限制已跳过」）。
+    ffmpeg 不可用时回退为跳过标记，等待重试。
+    """
+    try:
+        dur = get_audio_duration(audio_path)
+        if dur and dur <= chunk_sec:
+            segs, _ = model.transcribe(audio_path, beam_size=5, language=lang, vad_filter=True)
+            parts = [s.text.strip() for s in segs]
+            return " ".join(parts) if parts else "[未检测到语音]"
+        n = max(1, int((dur + chunk_sec - 1) // chunk_sec)) if dur else 1
+        out_dir = tempfile.mkdtemp(prefix="pl_seg_")
+        parts = []
+        try:
+            for i in range(n):
+                start = i * chunk_sec
+                seg_path = os.path.join(out_dir, "seg_%d.wav" % i)
+                cmd = ["ffmpeg", "-y", "-ss", str(start), "-i", audio_path,
+                       "-t", str(chunk_sec), "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
+                       "-loglevel", "error", seg_path]
+                subprocess.run(cmd, check=True, timeout=300, capture_output=True)
+                if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
+                    s2, _ = model.transcribe(seg_path, beam_size=5, language=lang, vad_filter=True)
+                    parts.append(" ".join(x.text.strip() for x in s2))
+        finally:
+            try: shutil.rmtree(out_dir, ignore_errors=True)
+            except: pass
+        full = " ".join(p for p in parts if p).strip()
+        return full if full else "[未检测到语音]"
+    except Exception as e:
+        return f"[分段转录失败: {str(e)[:180]}]"
+
+
 def transcribe_file(file_path, media_type="audio"):
-    """转录文件（调用方需自行处理超时）"""
+    """转录文件（调用方需自行处理超时）。长音视频(>2h)自动分段转录，不再硬跳过。"""
     wav_path = None
     try:
         if media_type == "video":
@@ -2215,9 +2296,12 @@ def transcribe_file(file_path, media_type="audio"):
         else:
             audio_path = file_path
         duration = get_audio_duration(audio_path)
-        if duration > 7200:
-            return f"[文件时长 {duration/3600:.1f} 小时，超过2小时限制，已跳过]"
         model = get_whisper_model()
+        # 长媒体分段转录（解除原 >2h 硬上限）；单段(<=2h)走原路径
+        max_single = float(os.environ.get("WHISPER_MAX_SEC", "7200"))
+        if duration and duration > max_single:
+            chunk_sec = int(os.environ.get("WHISPER_CHUNK_SEC", "1200"))
+            return _transcribe_segments(model, audio_path, chunk_sec=chunk_sec, lang="zh")
         segments, info = model.transcribe(audio_path, beam_size=5, language="zh", vad_filter=True)
         text_parts = [seg.text.strip() for seg in segments]
         return " ".join(text_parts) if text_parts else "[未检测到语音]"
@@ -2228,10 +2312,8 @@ def transcribe_file(file_path, media_type="audio"):
             try: os.unlink(wav_path)
             except: pass
 
-def summarize_text(text, model_name="qwen2.5:7b", timeout_sec=180):
-    if len(text) > 8000:
-        text = text[:8000] + "\n... (文本过长已截断)"
-    prompt = f"""请为以下音频/视频的转录文字写一个简洁的摘要（300字以内），包括：
+def _summary_prompt(text):
+    return f"""请为以下音频/视频的转录文字写一个简洁的摘要（300字以内），包括：
 1. 主题概述
 2. 关键要点（3-5条）
 3. 目标受众或用途
@@ -2240,8 +2322,58 @@ def summarize_text(text, model_name="qwen2.5:7b", timeout_sec=180):
 {text}
 
 摘要："""
+
+
+def _split_text(text, max_chars=6000):
+    """按段落切分文本，尽量让每块接近 max_chars（单段超长则硬切）。"""
+    paras = (text or "").split("\n")
+    chunks = []; cur = ""
+    for p in paras:
+        if cur and len(cur) + len(p) + 1 > max_chars:
+            chunks.append(cur); cur = ""
+        if len(p) > max_chars:
+            while len(p) > max_chars:
+                chunks.append(p[:max_chars]); p = p[max_chars:]
+            cur = p
+        else:
+            cur = (cur + "\n" + p) if cur else p
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def summarize_text(text, model_name="qwen2.5:7b", timeout_sec=180):
+    """生成媒体摘要。短文本(<=8000字)单次摘要；长文本分块 map-reduce，消除原 8000 字截断丢失。"""
+    text = (text or "").strip()
+    if not text:
+        return "[摘要为空]"
+    # 单块（<=8000 字）直接摘要
+    if len(text) <= 8000:
+        try:
+            result = _ollama_generate(_summary_prompt(text), model=model_name, timeout=timeout_sec, temperature=0.3, num_predict=600)
+            return result if result else "[摘要为空]"
+        except OllamaError as e:
+            return f"[摘要失败: {str(e)[:100]}]"
+        except Exception as e:
+            return f"[摘要请求失败: {str(e)[:100]}]"
+    # 长文本分块：每块先摘要点，再合并做总摘要
+    chunks = _split_text(text, 6000)
+    partials = []
+    for ch in chunks:
+        try:
+            s = _ollama_generate(_summary_prompt(ch), model=model_name, timeout=timeout_sec, temperature=0.3, num_predict=400)
+            if s:
+                partials.append(s.strip())
+        except Exception:
+            pass
+    combined = "\n\n".join(x for x in partials if x)
+    if not combined:
+        return "[摘要为空]"
+    # 合并后再摘要（极端超长时截断到 8000 字以内做整合）
+    merge_src = combined if len(combined) <= 8000 else combined[:8000]
+    final_prompt = ("以下是多段摘要的合并，请整合为一份连贯的总摘要（300字以内）：\n\n" + merge_src)
     try:
-        result = _ollama_generate(prompt, model=model_name, timeout=timeout_sec, temperature=0.3, num_predict=600)
+        result = _ollama_generate(final_prompt, model=model_name, timeout=timeout_sec, temperature=0.3, num_predict=600)
         return result if result else "[摘要为空]"
     except OllamaError as e:
         return f"[摘要失败: {str(e)[:100]}]"
@@ -2345,6 +2477,107 @@ def run_media_summarize_async(count=10):
             _count_cache["time"] = 0
     threading.Thread(target=w, daemon=True).start()
     return {"status":"started"}
+
+
+def run_transcribe_retry_async(count=50):
+    """重试历史失败/跳过的转录（[转录失败]/[转录超时]/[文件不存在]/[分段转录失败]）。
+
+    修复「188 条 WinError 2(fmpeg 缺失)失败」等：确认 ffmpeg 在 PATH 后重跑即可补全。
+    长音视频会走分段转录(transcribe_file 内部)完整补齐。
+    """
+    if _task_status.get('trr'): return {"status":"running"}
+    _task_status['trr'] = True
+    _task_status['trr_r'] = {"done":0,"total":0}
+    def w():
+        try:
+            media_list = dbq(
+                "SELECT id,title,file_path,media_type FROM media WHERE status='active' "
+                "AND transcript IS NOT NULL AND (transcript LIKE '[转录失败%' OR transcript LIKE '[转录超时%' "
+                "OR transcript='[文件不存在]' OR transcript LIKE '[分段转录失败%') "
+                "ORDER BY updated_at ASC LIMIT ?", (int(count),))
+            rv = {"done":0,"total":len(media_list),"current":"","error_count":0}
+            for m in media_list:
+                try:
+                    fp = _resolve_path(m['file_path'])
+                    rv["current"] = m['title'][:50]
+                    _task_status['trr_r'] = rv
+                    if not os.path.exists(fp):
+                        dbe("UPDATE media SET transcript='[文件不存在]', updated_at=datetime('now') WHERE id=?", (m['id'],))
+                        rv["done"] += 1; rv["error_count"] += 1; continue
+                    result_holder = [None]
+                    def _do():
+                        result_holder[0] = transcribe_file(fp, m['media_type'])
+                    t = threading.Thread(target=_do, daemon=True); t.start(); t.join(timeout=1200)
+                    if t.is_alive():
+                        dbe("UPDATE media SET transcript='[转录超时: 超过20分钟，已跳过]', updated_at=datetime('now') WHERE id=?", (m['id'],))
+                        rv["done"] += 1; rv["error_count"] += 1
+                    else:
+                        transcript = result_holder[0] if result_holder[0] else "[转录结果为空]"
+                        model_name = os.environ.get("WHISPER_MODEL", "medium")
+                        dbe("UPDATE media SET transcript=?, transcript_model=?, updated_at=datetime('now') WHERE id=?", (transcript, f"faster-whisper-{model_name}", m['id']))
+                        rv["done"] += 1
+                    _task_status['trr_r'] = rv
+                except Exception as e:
+                    print(f"[重试转录异常] {m['title'][:30]}: {e}", flush=True)
+                    try:
+                        dbe("UPDATE media SET transcript=?, updated_at=datetime('now') WHERE id=?", (f"[转录失败: {str(e)[:200]}]", m['id']))
+                    except: pass
+                    rv["done"] += 1; rv["error_count"] += 1
+                    _task_status['trr_r'] = rv
+            _task_status['trr'] = False; _count_cache["time"] = 0
+        finally:
+            _task_status['trr'] = False; _count_cache["time"] = 0
+    threading.Thread(target=w, daemon=True).start()
+    return {"status":"started"}
+
+
+def run_media_resummarize_long_async(count=200):
+    """对超长转录(>8000字)且摘要为空/占位的媒体，用分块 map-reduce 重摘要，消除原 8000 字截断丢失。
+
+    仅处理 summary 为 NULL 或占位([摘要*]/[无可转录*]/[摘要结果为空])的长媒体，
+    避免覆盖已有真实摘要。若想刷新历史上被截断但仍真实的摘要，可先
+    `UPDATE media SET summary=NULL WHERE length(transcript)>8000 AND summary NOT LIKE '[%'` 再跑本任务。
+    """
+    if _task_status.get('msl'): return {"status":"running"}
+    _task_status['msl'] = True
+    _task_status['msl_r'] = {"done":0,"total":0}
+    def w():
+        try:
+            media_list = dbq(
+                "SELECT id,title,transcript FROM media WHERE status='active' "
+                "AND transcript IS NOT NULL AND length(transcript)>8000 "
+                "AND (summary IS NULL OR summary LIKE '[摘要%' OR summary LIKE '[无可转录%' OR summary='[摘要结果为空]') "
+                "LIMIT ?", (int(count),))
+            rv = {"done":0,"total":len(media_list),"current":"","error_count":0}
+            for m in media_list:
+                try:
+                    rv["current"] = m['title'][:50]
+                    _task_status['msl_r'] = rv
+                    result_holder = [None]
+                    def _do(txt=m['transcript']):
+                        result_holder[0] = summarize_text(txt)
+                    t = threading.Thread(target=_do, daemon=True); t.start(); t.join(timeout=300)
+                    if t.is_alive():
+                        dbe("UPDATE media SET summary='[摘要超时: 超过5分钟，已跳过]', summary_model='timeout', summary_updated=datetime('now') WHERE id=?", (m['id'],))
+                        rv["done"] += 1; rv["error_count"] += 1
+                    else:
+                        summary = result_holder[0] if result_holder[0] else "[摘要结果为空]"
+                        dbe("UPDATE media SET summary=?, summary_model=?, summary_updated=datetime('now') WHERE id=?", (summary, "qwen2.5:7b", m['id']))
+                        rv["done"] += 1
+                    _task_status['msl_r'] = rv
+                except Exception as e:
+                    print(f"[重摘要异常] {m['title'][:30]}: {e}", flush=True)
+                    try:
+                        dbe("UPDATE media SET summary=?, summary_model='error', summary_updated=datetime('now') WHERE id=?", (f"[摘要失败: {str(e)[:200]}]", m['id']))
+                    except: pass
+                    rv["done"] += 1; rv["error_count"] += 1
+                    _task_status['msl_r'] = rv
+            _task_status['msl'] = False; _count_cache["time"] = 0
+        finally:
+            _task_status['msl'] = False; _count_cache["time"] = 0
+    threading.Thread(target=w, daemon=True).start()
+    return {"status":"started"}
+
 
 def run_transcribe_one_async(media_id):
     if _task_status.get('tr1'): return {"status":"running"}
@@ -2481,7 +2714,9 @@ class H(http.server.SimpleHTTPRequestHandler):
             if path == "/api/extract-ocr/status": self.json(_task_status.get('eor_r', {"running":False,"done":0,"total":0})); return
             # 媒体转录/摘要 20260801
             if path == "/api/media/transcribe": self.json(run_transcribe_async(data.get('count',10), data.get('media_type','all'))); return
+            if path == "/api/media/transcribe-retry": self.json(run_transcribe_retry_async(data.get('count',50))); return
             if path == "/api/media/summarize": self.json(run_media_summarize_async(data.get('count',10))); return
+            if path == "/api/media/summarize-long": self.json(run_media_resummarize_long_async(data.get('count',200))); return
             if path == "/api/media/transcribe-one": self.json(run_transcribe_one_async(data.get('media_id',''))); return
             if path == "/api/tools/run": self.json(_tool_run(data)); return
             if path == "/api/title-norm/recompute": self.json(_title_norm_recompute()); return
@@ -2676,7 +2911,7 @@ class H(http.server.SimpleHTTPRequestHandler):
         try:
             if path=="/api/health": self.json({"status":"ok"})
             elif path=="/api/tools/status": self.json(_tool_status())
-            elif path=="/api/task-status": self.json({"classify":_task_status.get('cr_r',{}),"summarize":_task_status.get('sr_r',{}),"extract":_task_status.get('er_r',{}),"transcribe":_task_status.get('tr_r',{}),"media_summarize":_task_status.get('ms_r',{}),"scan_import":_task_status.get('ir_r',{}),"metadata":_task_status.get('mr_r',{})})
+            elif path=="/api/task-status": self.json({"classify":_task_status.get('cr_r',{}),"summarize":_task_status.get('sr_r',{}),"extract":_task_status.get('er_r',{}),"transcribe":_task_status.get('tr_r',{}),"transcribe_retry":_task_status.get('trr_r',{}),"media_summarize":_task_status.get('ms_r',{}),"media_resummarize_long":_task_status.get('msl_r',{}),"scan_import":_task_status.get('ir_r',{}),"metadata":_task_status.get('mr_r',{})})
             elif path=="/api/title-norm/recompute-status": self.json(_title_norm_recompute_status()); return
             elif path=="/api/stats": self.json(_lib_stats()); return
             elif path=="/api/summary-fix/pending": self.json(_summary_fix_pending()); return
@@ -3238,26 +3473,49 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
                 h+='</div>'
 
         elif pn=='media':
-            mp=int(qs.get('page',['1'])[0])
-            q=qs.get('q',[''])[0]
-            wh="status='active'"
-            params=[]
+            mp=int(qs.get('page',['1'])[0]); ps=30
+            q=qs.get('q',[''])[0]; mtype=qs.get('type',[''])[0]; trs=qs.get('trs',[''])[0]; msum=qs.get('sum',[''])[0]
+            wh="status='active'"; params=[]
             if q: wh+=" AND title LIKE ?"; params.append('%'+q+'%')
+            if mtype=='audio': wh+=" AND media_type='audio'"
+            elif mtype=='video': wh+=" AND media_type='video'"
+            if trs=='yes': wh+=" AND transcript IS NOT NULL AND transcript NOT LIKE '[转录失败%' AND transcript NOT LIKE '[转录超时%' AND transcript!='[文件不存在]' AND transcript NOT LIKE '[分段转录失败%'"
+            elif trs=='no': wh+=" AND (transcript IS NULL OR transcript LIKE '[转录失败%' OR transcript LIKE '[转录超时%' OR transcript='[文件不存在]' OR transcript LIKE '[分段转录失败%')"
+            if msum=='yes': wh+=" AND summary IS NOT NULL AND summary NOT LIKE '[摘要%' AND summary NOT LIKE '[无可转录%' AND summary!='[摘要结果为空]'"
+            elif msum=='no': wh+=" AND (summary IS NULL OR summary LIKE '[摘要%' OR summary LIKE '[无可转录%' OR summary='[摘要结果为空]')"
             total=dbq(f"SELECT count(*)as c FROM media WHERE {wh}",tuple(params))[0]['c']
-            rows=dbq(f"SELECT id,title,media_type,file_format,duration,file_size FROM media WHERE {wh} ORDER BY created_at DESC LIMIT 20 OFFSET ?",tuple(list(params)+[(mp-1)*20]))
+            rows=dbq(f"SELECT id,title,media_type,file_format,duration,file_size,transcript,summary FROM media WHERE {wh} ORDER BY created_at DESC LIMIT {ps} OFFSET ?",tuple(list(params)+[(mp-1)*ps]))
             h+='<h2>🎧 媒体库 ('+str(len(rows))+'/'+str(total)+')</h2>'
-            h+='<form class=search method=get><input type=hidden name=p value=media><input name=q placeholder="搜索音视频名称..." value="'+he(q)+'"><button>🔍 搜索</button></form>'
+            h+='<form class=sch method=get><input type=hidden name=p value=media>'
+            h+='<input name=q placeholder="搜索音视频名称..." value="'+he(q)+'">'
+            h+='<select name=type><option value="">全部类型</option><option value=audio'+(' selected' if mtype=='audio' else '')+'>🎵 音频</option><option value=video'+(' selected' if mtype=='video' else '')+'>🎬 视频</option></select>'
+            h+='<select name=trs><option value="">转录状态</option><option value=yes'+(' selected' if trs=='yes' else '')+'>已转录</option><option value=no'+(' selected' if trs=='no' else '')+'>未转录/失败</option></select>'
+            h+='<select name=sum><option value="">摘要状态</option><option value=yes'+(' selected' if msum=='yes' else '')+'>已摘要</option><option value=no'+(' selected' if msum=='no' else '')+'>未摘要</option></select>'
+            h+='<button>🔍 筛选</button></form>'
+            h+='<div class=grid>'
             for r in rows:
-                ic='🎵'if r['media_type']=='audio'else'🎬';d=r['duration']or 0;dur=str(int(d/60))+':'+str(int(d%60)).zfill(2)
-                
-                h+='<div class=bk><div style="width:60px;height:60px;border-radius:8px;background:linear-gradient(135deg,#667eea,#764ba2);display:flex;align-items:center;justify-content:center;font-size:28px;color:#fff;flex-shrink:0">'+ic+'</div><div class=info><div class=t>'+he(r['title'])[:60]+'</div><div class=m>'+r['file_format'].upper()+' · '+dur+' <a href="/api/media/'+r['id']+'/file" target=_blank style="font-size:12px">▶播放</a> <a href="/?p=media_detail&id='+r['id']+'" style="font-size:12px">📋详情</a></div></div></div>'
-
-               
-            if total>20:
-                tp=(total+19)//20;qe=urllib.parse.quote(q)
+                ic='🎵'if r['media_type']=='audio'else'🎬';d=r['duration']or 0;dur=str(int(d//60))+':'+str(int(d%60)).zfill(2)
+                tr=r['transcript'] or ''; su=r['summary'] or ''
+                tr_ok = tr.strip()!='' and not tr.startswith('[')
+                su_ok = su.strip()!='' and not su.startswith('[')
+                bdg=''
+                if tr_ok: bdg+='<span style="color:#52c41a">✓转录</span> '
+                if su_ok: bdg+='<span style="color:#eb2f96">✓摘要</span>'
+                h+='<a class=card href="/?p=media_detail&id='+r['id']+'">'
+                h+='<div class=cv style="display:flex;align-items:center;justify-content:center;font-size:42px;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff">'+ic+'</div>'
+                h+='<div class=t>'+he(r['title'])[:44]+'</div>'
+                h+='<div style="font-size:11px;color:#999;padding:0 8px 8px;line-height:1.5">'+r['file_format'].upper()+' · '+dur+((' · '+bdg) if bdg else '')+'</div>'
+                h+='</a>'
+            h+='</div>'
+            if total>ps:
+                tp=(total+ps-1)//ps;qe=urllib.parse.quote(q)
+                qs_str='&q='+qe if qe else ''
+                if mtype: qs_str+='&type='+mtype
+                if trs: qs_str+='&trs='+trs
+                if msum: qs_str+='&sum='+msum
                 h+='<div style=text-align:center;margin-top:12px;font-size:14px>共 '+str(total)+' 个 页 '+str(mp)+'/'+str(tp)+' '
-                if mp>1:h+='<a href="?p=media&q='+qe+'&page='+str(mp-1)+'">上一页</a> '
-                if mp<tp:h+='<a href="?p=media&q='+qe+'&page='+str(mp+1)+'">下一页</a> '
+                if mp>1:h+='<a href="?p=media&page='+str(mp-1)+qs_str+'">上一页</a> '
+                if mp<tp:h+='<a href="?p=media&page='+str(mp+1)+qs_str+'">下一页</a> '
                 h+='</div>'
 
         elif pn=='import':
@@ -3297,11 +3555,28 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
                 v=cov.get(k,0); pct=(v*100.0/total) if total else 0
                 h+='<tr><td style="border:1px solid #ddd;padding:6px">'+lab+'</td><td style="border:1px solid #ddd;padding:6px">'+str(v)+'</td><td style="border:1px solid #ddd;padding:6px">'+('%.1f'%(pct))+'%</td><td style="border:1px solid #ddd;padding:6px;width:220px"><div style="background:#1677ff;height:10px;border-radius:5px;width:'+str(min(100,pct))+'%"></div></td></tr>'
             h+='</table></div>'
-            h+='<div class=panel><h3>🛠️ 各工具续跑进度（progress.db）</h3><table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f3f3f3"><th style="border:1px solid #ddd;padding:6px;text-align:left">工具</th><th style="border:1px solid #ddd;padding:6px;text-align:left">已完成(done)</th><th style="border:1px solid #ddd;padding:6px;text-align:left">已跳过(skip)</th><th style="border:1px solid #ddd;padding:6px;text-align:left">状态</th></tr>'
+            h+='<div class=panel><h3>🛠️ 工具完成情况 + 续跑情况</h3>'
+            h+='<p class=co>「实际完成」来自数据库真实统计（导入期与手动触发都已计入），「续跑」来自 progress.db 的离线批处理计数（仅统计本次会话经工具中心跑批的量，进程崩溃可续跑）。二者互补：前者看成果、后者看跑批进度。</p>'
+            # 实际完成量（真实统计）
+            _real = {}
+            _real['meta'] = dbq("SELECT COUNT(*) c FROM books WHERE status='active' AND ((publisher IS NOT NULL AND publisher<>'') OR (isbn IS NOT NULL AND isbn<>''))")[0]['c']
+            _real['extract'] = cov.get('text_extracted',0)
+            _real['classify'] = dbq("SELECT COUNT(*) c FROM books b WHERE status='active' AND id IN (SELECT book_id FROM book_categories bc WHERE bc.subcategory_id IS NOT NULL)")[0]['c']
+            _real['summarize'] = cov.get('summary',0)
+            _real['title_norm'] = cov.get('named',0)
+            _real['transcribe'] = dbq("SELECT COUNT(*) c FROM media WHERE status='active' AND transcript IS NOT NULL AND transcript NOT LIKE '[转录失败%' AND transcript NOT LIKE '[转录超时%' AND transcript!='[文件不存在]' AND transcript NOT LIKE '[分段转录失败%'")[0]['c']
+            _real['media_summarize'] = dbq("SELECT COUNT(*) c FROM media WHERE status='active' AND summary IS NOT NULL AND summary NOT LIKE '[摘要%' AND summary NOT LIKE '[无可转录%' AND summary!='[摘要结果为空]'")[0]['c']
+            _real['kg'] = st['tools'].get('kg',{}).get('done',0)
+            _scope = {'kg':total,'meta':total,'extract':total,'classify':total,'summarize':total,'title_norm':total,'transcribe':tm,'media_summarize':tm}
             tnames={'kg':'知识图谱 L1','meta':'元数据补全','summary':'摘要修复','extract':'提取文本','classify':'AI 分类','summarize':'AI 摘要','transcribe':'媒体转录','media_summarize':'媒体摘要','metadata':'在线元数据'}
+            h+='<table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f3f3f3"><th style="border:1px solid #ddd;padding:6px;text-align:left">工具</th><th style="border:1px solid #ddd;padding:6px;text-align:left">实际完成</th><th style="border:1px solid #ddd;padding:6px;text-align:left">总量</th><th style="border:1px solid #ddd;padding:6px;text-align:left">完成率</th><th style="border:1px solid #ddd;padding:6px;text-align:left">续跑 done</th><th style="border:1px solid #ddd;padding:6px;text-align:left">续跑 skip</th><th style="border:1px solid #ddd;padding:6px;text-align:left">状态</th></tr>'
             for t,v in st['tools'].items():
                 run='🟢 运行中' if v.get('running') else '⚪ 空闲'
-                h+='<tr><td style="border:1px solid #ddd;padding:6px">'+tnames.get(t,t)+'</td><td style="border:1px solid #ddd;padding:6px">'+str(v.get('done',0))+'</td><td style="border:1px solid #ddd;padding:6px">'+str(v.get('skip',0))+'</td><td style="border:1px solid #ddd;padding:6px">'+run+'</td></tr>'
+                rc = _real.get(t, _real.get(t.split('_')[0], 0)) if t!='metadata' else _real.get('meta',0)
+                sc = _scope.get(t, total)
+                pctv = ('%.1f'%(rc*100.0/sc)) if sc else '0.0'
+                comp = ('%d'%rc) if t!='summary' else ('%d（待修 %d）'%(cov.get('summary',0), st.get('fake_summary',0)))
+                h+='<tr><td style="border:1px solid #ddd;padding:6px">'+tnames.get(t,t)+'</td><td style="border:1px solid #ddd;padding:6px">'+comp+'</td><td style="border:1px solid #ddd;padding:6px">'+str(sc)+'</td><td style="border:1px solid #ddd;padding:6px">'+pctv+'%</td><td style="border:1px solid #ddd;padding:6px">'+str(v.get('done',0))+'</td><td style="border:1px solid #ddd;padding:6px">'+str(v.get('skip',0))+'</td><td style="border:1px solid #ddd;padding:6px">'+run+'</td></tr>'
             h+='</table></div>'
         elif pn=='title-norm':
             h+='<h2>📐 书名规则化对比表</h2>'
@@ -3369,6 +3644,9 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             h+='<div class=panel><h3>🎙️ 媒体转录与摘要</h3><p class=co style=margin-bottom:8px>待转录: '+str(tm - ct.get("mtr",0))+' 个 | 已转录待摘要: '+str(ct.get("mtr",0) - ct.get("msu",0))+' 个</p>'
             h+='<div style="margin-bottom:8px"><label style=font-size:13px>转录数量 </label><select id=trsCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=5>5 个</option><option value=10 selected>10 个</option><option value=50>50 个</option><option value=100>100 个</option><option value=500>500 个</option></select> <select id=trsType style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=all>全部媒体</option><option value=audio>仅音频</option><option value=video>仅视频</option></select> <button class=btn id=trsBtn onclick="TRS()">🎙️ 媒体转录</button></div>'
             h+='<div><label style=font-size:13px>摘要数量 </label><select id=msuCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=50>50 个</option><option value=100 selected>100 个</option><option value=500>500 个</option><option value=1000>1000 个</option></select> <button class=btn id=msuBtn onclick="MSU()" style=background:#eb2f96>📝 转录→摘要</button></div>'
+            h+='<div style="margin-top:8px;border-top:1px dashed #eee;padding-top:8px;font-size:12px;color:#888">⚠️ 历史修复（确认 ffmpeg/独显就绪后跑）</div>'
+            h+='<div style="margin-bottom:6px"><button class=btn id=trsRBtn onclick="TRSR()" style="background:#fa8c16">🔁 重试失败转录</button> <span id=trsRRes style=font-size:13px></span></div>'
+            h+='<div><button class=btn id=mslBtn onclick="MSUL()" style="background:#722ed1">🔁 重摘要超长媒体(>8000字)</button> <span id=mslRes style=font-size:13px></span></div>'
             h+='<div id=trsRes style=margin-top:4px;font-size:13px></div><div id=msuRes style=margin-top:4px;font-size:13px></div></div>'
     
             #媒体库转录、摘要面板20260801结束
