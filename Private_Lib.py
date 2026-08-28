@@ -3167,25 +3167,37 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             _chg=dbq("SELECT COUNT(*) AS c FROM books WHERE normalized_title IS NOT NULL AND normalized_title<>'' AND normalized_title<>title")[0]['c']
             _unc=dbq("SELECT COUNT(*) AS c FROM books WHERE normalized_title=title OR normalized_title='' OR normalized_title IS NULL")[0]['c']
             _up=dbq("SELECT COUNT(*) AS c FROM books WHERE normalized_title LIKE 'upload_%'")[0]['c']
+            _ext=dbq("SELECT COUNT(*) AS c FROM books WHERE text_extracted=1")[0]['c']
+            _noext=dbq("SELECT COUNT(*) AS c FROM books WHERE text_extracted=0 OR text_extracted IS NULL")[0]['c']
             _w="1=1"; _pa=[]
             if _tn_q: _w+=" AND title LIKE ?"; _pa.append('%'+_tn_q+'%')
             if _tn_mode=='changed': _w+=" AND normalized_title<>title AND normalized_title<>''"
             elif _tn_mode=='unchanged': _w+=" AND (normalized_title=title OR normalized_title='' OR normalized_title IS NULL)"
             elif _tn_mode=='upload': _w+=" AND normalized_title LIKE 'upload_%'"
+            elif _tn_mode=='no_text': _w+=" AND (text_extracted=0 OR text_extracted IS NULL)"
             _tr=dbq("SELECT COUNT(*) AS c FROM books WHERE "+_w,_pa)[0]['c']
             _pages=max(1,( _tr+_tn_ps-1)//_tn_ps)
             _tn_page=max(1,min(_tn_page,_pages))
-            _rows=dbq("SELECT id,title,normalized_title FROM books WHERE "+_w+" ORDER BY id LIMIT ? OFFSET ?",_pa+[_tn_ps,(_tn_page-1)*_tn_ps])
-            h+='<div class=panel><p class=co>总书数 <b>'+str(_tot)+'</b> · 已被规则改写(存库) <b>'+str(_chg)+'</b> · 未变/无解回退 <b>'+str(_unc)+'</b> · 其中 upload_ 无解 <b>'+str(_up)+'</b> 本。</p>'
+            _rows=dbq("SELECT id,title,normalized_title,file_format,text_extracted FROM books WHERE "+_w+" ORDER BY id LIMIT ? OFFSET ?",_pa+[_tn_ps,(_tn_page-1)*_tn_ps])
+            h+='<div class=panel><p class=co>总书数 <b>'+str(_tot)+'</b> · 已被规则改写(存库) <b>'+str(_chg)+'</b> · 未变/无解回退 <b>'+str(_unc)+'</b> · 其中 upload_ 无解 <b>'+str(_up)+'</b> 本。 · 已抽正文 <b style="color:#52c41a">'+str(_ext)+'</b> 本 · 未抽 <b style="color:#fa8c16">'+str(_noext)+'</b> 本（扫描版/损坏/压缩包，详见下表「文本抽取」列）。</p>'
             h+='<p class=co>下表「规则化结果」为对<b>当前书名</b>实时套用 normalize_title() 规则所得（避免显示书名被后续补全更新造成的旧值漂移）。点「重算写回」(工具中心) 可把结果同步回 normalized_title 列。</p>'
-            h+='<form class=sch method=get style="margin:8px 0"><input type=hidden name=p value=title-norm>模式<select name=mode><option value=all'+(' selected' if _tn_mode=='all' else '')+'>全部</option><option value=changed'+(' selected' if _tn_mode=='changed' else '')+'>仅被改写</option><option value=unchanged'+(' selected' if _tn_mode=='unchanged' else '')+'>仅未变</option><option value=upload'+(' selected' if _tn_mode=='upload' else '')+'>仅 upload_ 无解</option></select> <input name=q placeholder="搜索书名" value="'+he(_tn_q)+'"><button>筛选</button></form>'
-            h+='<table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f3f3f3"><th style="border:1px solid #ddd;padding:6px;text-align:left"><input type=checkbox id=selAll onclick="selAll(this)" title="全选本页"></th><th style="border:1px solid #ddd;padding:6px;text-align:left">#</th><th style="border:1px solid #ddd;padding:6px;text-align:left">原书名（当前）</th><th style="border:1px solid #ddd;padding:6px;text-align:left">规则化结果</th><th style="border:1px solid #ddd;padding:6px;text-align:left">状态</th></tr>'
+            h+='<form class=sch method=get style="margin:8px 0"><input type=hidden name=p value=title-norm>模式<select name=mode><option value=all'+(' selected' if _tn_mode=='all' else '')+'>全部</option><option value=changed'+(' selected' if _tn_mode=='changed' else '')+'>仅被改写</option><option value=unchanged'+(' selected' if _tn_mode=='unchanged' else '')+'>仅未变</option><option value=upload'+(' selected' if _tn_mode=='upload' else '')+'>仅 upload_ 无解</option><option value=no_text'+(' selected' if _tn_mode=='no_text' else '')+'>仅未抽正文</option></select> <input name=q placeholder="搜索书名" value="'+he(_tn_q)+'"><button>筛选</button></form>'
+            h+='<table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f3f3f3"><th style="border:1px solid #ddd;padding:6px;text-align:left"><input type=checkbox id=selAll onclick="selAll(this)" title="全选本页"></th><th style="border:1px solid #ddd;padding:6px;text-align:left">#</th><th style="border:1px solid #ddd;padding:6px;text-align:left">原书名（当前）</th><th style="border:1px solid #ddd;padding:6px;text-align:left">规则化结果</th><th style="border:1px solid #ddd;padding:6px;text-align:left">状态</th><th style="border:1px solid #ddd;padding:6px;text-align:left">文本抽取</th></tr>'
             for _i,_r in enumerate(_rows):
                 _t=_r['title'] or ''
                 _nt=normalize_title(_t)
                 _st='改写' if _nt!=(_t or '').strip() else '未变'
                 if _nt.startswith('upload_'): _st='无解(random)'
-                h+='<tr><td style="border:1px solid #ddd;padding:6px"><input type=checkbox class=rowcb name=bid value="'+he(str(_r['id']))+'"></td><td style="border:1px solid #ddd;padding:6px">'+str((_tn_page-1)*_tn_ps+_i+1)+'</td><td style="border:1px solid #ddd;padding:6px">'+he(_t)+'</td><td style="border:1px solid #ddd;padding:6px">'+he(_nt)+'</td><td style="border:1px solid #ddd;padding:6px">'+_st+'</td></tr>'
+                _fm=_r.get('file_format') or ''
+                _te=_r.get('text_extracted') or 0
+                if _te==1:
+                    _ext='<span style="color:#52c41a">✅ 已抽</span>'
+                else:
+                    if _fm=='pdf': _ext='<span style="color:#888">⚪ 扫描版(无文字层)</span>'
+                    elif _fm in ('epub','mobi','azw3'): _ext='<span style="color:#fa8c16">🟡 文件损坏/未抽</span>'
+                    elif _fm in ('rar','zip','7z'): _ext='<span style="color:#1677ff">📦 压缩包</span>'
+                    else: _ext='<span style="color:#888">⚪ 未抽</span>'
+                h+='<tr><td style="border:1px solid #ddd;padding:6px"><input type=checkbox class=rowcb name=bid value="'+he(str(_r['id']))+'"></td><td style="border:1px solid #ddd;padding:6px">'+str((_tn_page-1)*_tn_ps+_i+1)+'</td><td style="border:1px solid #ddd;padding:6px">'+he(_t)+'</td><td style="border:1px solid #ddd;padding:6px">'+he(_nt)+'</td><td style="border:1px solid #ddd;padding:6px">'+_st+'</td><td style="border:1px solid #ddd;padding:6px">'+_ext+'</td></tr>'
             h+='</table>'
             h+='<div style="margin:12px 0 4px"><label style="font-size:13px"><input type=checkbox id=selAll2 onclick="selAll(this)"> 全选本页</label> &nbsp; <button class=btn onclick="ADOPT()">✅ 采纳选中为正式书名</button> <span id=tnAdoptRes style="font-size:13px;color:#1677ff"></span></div>'
             h+='<p class=co>「采纳为正式书名」将把勾选书的 <b>title</b> 改为上表「规则化结果」（upload_ 无解的书自动跳过，不会误覆盖）。</p>'
