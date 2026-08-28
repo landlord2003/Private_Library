@@ -52,6 +52,7 @@ def get_counts():
             "cat_dist": "SELECT cat.id as cid,cat.name as k,count(*)as c FROM categories cat JOIN book_categories bc ON cat.id=bc.category_id JOIN books b ON b.id=bc.book_id WHERE b.status='active' GROUP BY cat.id,cat.name ORDER BY c DESC LIMIT 20",
             "mtr": "SELECT count(*)as c FROM media WHERE status='active' AND transcript IS NOT NULL",
             "msu": "SELECT count(*)as c FROM media WHERE status='active' AND summary IS NOT NULL",
+            "meta_done": "SELECT count(*)as c FROM books WHERE status='active' AND ((publisher IS NOT NULL AND publisher<>'') OR (isbn IS NOT NULL AND isbn<>''))",
         }
         for k, sql in queries.items():
             try:
@@ -263,11 +264,19 @@ def _tool_center_html():
     # 在服实时
     h += '<div style="display:flex;flex-wrap:wrap;margin-top:6px">'
     h += '<div style="width:100%;font-weight:700;margin:10px 6px 0;color:#1677ff">⚡ 在服实时工具（首页「AI 处理」面板触发）</div>'
-    h += card('🏷️','AI 分类','导入或手动触发，调用本机 Ollama 给书打一级/二级分类+标签+难度。','进度 %d 本' % tools.get('classify',{}).get('done',0), tools.get('classify',{}).get('done',0), '#1677ff', '', '', '<a class=btn href="/">前往首页 AI 面板</a>')
-    h += card('🤖','AI 摘要','基于正文生成结构化 AI 摘要(一句话/观点/概念/读者/难度)。','进度 %d 本' % tools.get('summarize',{}).get('done',0), tools.get('summarize',{}).get('done',0), '#1677ff', '', '', '<a class=btn href="/">前往首页 AI 面板</a>')
-    h += card('🔎','在线元数据','导入时实时调 Open Library 补全出版社/ISBN。','进度 %d 本' % tools.get('metadata',{}).get('done',0), tools.get('metadata',{}).get('done',0), '#1677ff', '', '', '<a class=btn href="/">前往首页 AI 面板</a>')
-    h += card('🎧','媒体转录','Whisper 转录音视频为文字，存 media.transcript。','进度 %d 条' % tools.get('transcribe',{}).get('done',0), tools.get('transcribe',{}).get('done',0), '#1677ff', '', '', '<a class=btn href="/?p=media">前往媒体库</a>')
-    h += card('📝','媒体摘要','基于转录文本生成媒体 AI 摘要。','进度 %d 条' % tools.get('media_summarize',{}).get('done',0), tools.get('media_summarize',{}).get('done',0), '#1677ff', '', '', '<a class=btn href="/?p=media">前往媒体库</a>')
+    gc = get_counts()
+    _tb = gc['tb']; _tm = gc['tm']
+    _cls = _tb - gc['import_rem']
+    _rs = cov['summary'] - st.get('fake_summary',0)
+    _md = gc.get('meta_done',0)
+    _mtr = gc.get('mtr',0); _msu = gc.get('msu',0)
+    def pctm(n): return min(100, round((n or 0)*100.0/max(_tm,1),1))
+    _run = lambda k: (' <span style="color:#52c41a">🟢运行中</span>' if tools.get(k,{}).get('running') else '')
+    h += card('🏷️','AI 分类','导入或手动触发，调用本机 Ollama 给书打一级/二级分类+标签+难度。','已分类 %d / %d 本 (%.1f%%)' % (_cls, _tb, pct(_cls)), _cls, '#1677ff', '', '', '<a class=btn href="/">前往首页 AI 面板</a>'+_run('classify'))
+    h += card('🤖','AI 摘要','基于正文生成结构化 AI 摘要(一句话/观点/概念/读者/难度)。','已摘要 %d / %d 本 (%.1f%%)' % (_rs, _tb, pct(_rs)), _rs, '#1677ff', '', '', '<a class=btn href="/">前往首页 AI 面板</a>'+_run('summarize'))
+    h += card('🔎','在线元数据','导入时实时调 Open Library 补全出版社/ISBN。','已补全 %d / %d 本 (%.1f%%)' % (_md, _tb, pct(_md)), _md, '#1677ff', '', '', '<a class=btn href="/">前往首页 AI 面板</a>'+_run('metadata'))
+    h += card('🎧','媒体转录','Whisper 转录音视频为文字，存 media.transcript。','已转录 %d / %d 条 (%.1f%%)' % (_mtr, _tm, pctm(_mtr)), _mtr, '#1677ff', '', '', '<a class=btn href="/?p=media">前往媒体库</a>'+_run('transcribe'))
+    h += card('📝','媒体摘要','基于转录文本生成媒体 AI 摘要。','已摘要 %d / %d 条 (%.1f%%)' % (_msu, _tm, pctm(_msu)), _msu, '#1677ff', '', '', '<a class=btn href="/?p=media">前往媒体库</a>'+_run('media_summarize'))
     h += '</div>'
     # JS：复用 TR/TP/SP/TNREC + 新增 EXTR
     h += '<div style="margin-top:10px"><button class=btn onclick="TP()">🔄 刷新进度</button> <span id=toolStat style="font-size:12px;color:#666"></span></div>'
@@ -3309,7 +3318,7 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             elif _tn_mode=='unchanged': _w+=" AND (normalized_title=title OR normalized_title='' OR normalized_title IS NULL)"
             elif _tn_mode=='upload': _w+=" AND normalized_title LIKE 'upload_%'"
             elif _tn_mode=='no_text': _w+=" AND (text_extracted=0 OR text_extracted IS NULL)"
-            elif _tn_mode=='corrupt': _w+=" AND file_format IN ('epub','mobi','azw3') AND (text_extracted=0 OR text_extracted IS NULL)"
+            elif _tn_mode=='corrupt': _w+=" AND file_format IN ('epub','mobi','azw3') AND (text_extracted=0 OR text_extracted IS NULL) AND (summary IS NULL OR summary='' OR summary LIKE '由于%' OR summary LIKE '抱歉%' OR summary LIKE '（以下%' OR summary LIKE '(以下%' OR summary LIKE '您好%' OR summary LIKE '你好%' OR summary LIKE '（注%' OR summary LIKE '注：%' OR summary LIKE '根据您%' OR summary LIKE '根据提供%' OR summary LIKE '我将%') AND id NOT IN (SELECT id FROM book_text WHERE length(text_content)>=50)"
             _tr=dbq("SELECT COUNT(*) AS c FROM books WHERE "+_w,_pa)[0]['c']
             _pages=max(1,( _tr+_tn_ps-1)//_tn_ps)
             _tn_page=max(1,min(_tn_page,_pages))
