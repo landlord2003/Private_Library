@@ -1181,25 +1181,78 @@ def _title_fallback(book_id):
             return True
         return False
 
+def _find_tesseract():
+    """定位 tesseract 可执行文件：先查 PATH，再探测 Windows 标准安装路径(常不在 PATH)。"""
+    import shutil as _sh, os as _os
+    ts = _sh.which("tesseract") or _sh.which("tesseract.exe")
+    if ts:
+        return ts
+    for cand in (
+        r"F:\my-library\tools\tesseract_ocr\tesseract.exe",
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ):
+        if _os.path.exists(cand):
+            return cand
+    return None
+
 def _ocr_pdf(file_path, max_pages=15):
     """扫描版PDF的OCR兜底。需主机安装 tesseract(+中文语言包 chi_sim)；缺失则优雅返回 ''，由调用方回落书名。"""
-    import shutil as _sh, subprocess as _sp, tempfile, os as _os
-    ts = _sh.which("tesseract") or _sh.which("tesseract.exe")
+    import subprocess as _sp, tempfile, os as _os
+    ts = _find_tesseract()
     if not ts:
         return ""
+    # OCR 临时文件统一写到项目盘(F)下的可写目录, 避免沙箱/权限禁止写入系统 Temp
+    # 导致 tesseract 输出写不进去、OCR 静默失败(整本回落书名)。
+    _ocr_tmp = r"F:\my-library\tools\ocr_tmp"
+    try:
+        _os.makedirs(_ocr_tmp, exist_ok=True)
+    except Exception:
+        _ocr_tmp = tempfile.gettempdir()
     try:
         import fitz
+        # 关闭 fitz 对超大页面图像的尺寸上限，否则扫描版大页会报
+        # "Overly large image" 导致该页渲染失败、整本 OCR 回退书名。
+        try:
+            fitz.TOOLS().set_max_image_size(0)
+        except Exception:
+            pass
         doc = fitz.open(file_path)
         pages = min(max_pages, doc.page_count)
         texts = []
         for i in range(pages):
-            pix = doc[i].get_pixmap(dpi=200)
-            tmp = _os.path.join(tempfile.gettempdir(), "lib_ocr_%d.png" % i)
-            pix.save(tmp)
+            # 自适应降分辨率：tesseract 单维像素上限约 32767px，超限会报
+            # "Image too large" 拒绝。逐档(200→150→100→72)尝试，取到首个
+            # 最大边<=32000px 的渲染；仍超限则至少交最后一档给 tesseract 试。
+            pix = None
+            for dpi in (200, 150, 100, 72):
+                try:
+                    p = doc[i].get_pixmap(dpi=dpi)
+                except Exception:
+                    continue
+                pix = p
+                if max(p.width, p.height) <= 32000:
+                    break
+            if pix is None:
+                continue
+            tmp = tempfile.NamedTemporaryFile(dir=_ocr_tmp, suffix=".png", delete=False).name
             try:
-                r = _sp.run([ts, tmp, "stdout", "-l", "chi_sim+eng"], capture_output=True, text=True, timeout=120)
-                if r.returncode == 0:
-                    texts.append(r.stdout)
+                pix.save(tmp)
+            except Exception:
+                try: _os.remove(tmp)
+                except Exception: pass
+                continue
+            try:
+                # 写到临时 txt(tesseract 默认以 UTF-8 写文件), 再读回, 规避 Windows 下
+                # tesseract 经 stdout 输出 GBK 导致 Python text=True 解码崩溃、整页丢字的问题。
+                out_txt = tempfile.NamedTemporaryFile(dir=_ocr_tmp, suffix=".txt", delete=False).name
+                tessdata_dir = _os.path.join(_os.path.dirname(ts), "tessdata")
+                r = _sp.run([ts, tmp, out_txt, "-l", "chi_sim+eng", "--tessdata-dir", tessdata_dir], capture_output=True, timeout=120)
+                if r.returncode == 0 and _os.path.exists(out_txt):
+                    with open(out_txt, "r", encoding="utf-8", errors="ignore") as _f:
+                        texts.append(_f.read())
+                try: _os.remove(out_txt)
+                except Exception: pass
             except Exception:
                 pass
             finally:
@@ -1379,12 +1432,12 @@ def run_extract_async(count=10):
 def run_extract_ocr_async():
     """扫描版OCR重抽：后台 spawn tools/run_extract_full.py ocr（多线程、可续跑），并轮询其独立日志(_ocr_run.log)上报进度。需本机已装 tesseract。"""
     if _task_status.get('eor'): return {"status":"running"}
-    if not shutil.which("tesseract") and not shutil.which("tesseract.exe"):
+    if not _find_tesseract():
         return {"status":"no_tesseract", "msg":"本机未安装 tesseract，请先运行 tools/install_tesseract.bat"}
     # chi_sim 中文包检测：tesseract 已装但缺 chi_sim 时 OCR 会静默空转(回落书名)
     try:
         import subprocess as _sp
-        ts = shutil.which("tesseract") or shutil.which("tesseract.exe")
+        ts = _find_tesseract()
         out = _sp.run([ts, "--list-langs"], capture_output=True, text=True, timeout=10).stdout
         if "chi_sim" not in out:
             return {"status":"no_chi_sim", "msg":"tesseract 已装但缺中文包 chi_sim，OCR 无法识别中文。请把 chi_sim.traineddata 放入 tessdata 目录，或重跑 tools/install_tesseract.bat"}

@@ -45,6 +45,8 @@ desktop.ini
 SumatraPDF/
 tools/ffmpeg/
 pdfjs/
+tools/tesseract_ocr/
+tools/ocr_tmp/
 
 # === WorkBuddy 内部 ===
 .workbuddy/

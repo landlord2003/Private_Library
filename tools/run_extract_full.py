@@ -67,8 +67,9 @@ def main():
         c2.commit(); c2.close()
         L(f"[skip-big] marked {len(big_ids)} files >50MB as processed (excluded from resume/ocr)")
     rows = real_rows
-    workers = 2 if mode == "ocr" else WORKERS
-    timeout = 180 if mode == "ocr" else PER_BOOK_TIMEOUT
+    # OCR 模式并发可经 OCR_WORKERS 覆盖(默认4);超时 OCR_WORKERS_TIMEOUT(默认180)
+    workers = int(os.environ.get("OCR_WORKERS", "4")) if mode == "ocr" else WORKERS
+    timeout = int(os.environ.get("OCR_WORKERS_TIMEOUT", "180")) if mode == "ocr" else PER_BOOK_TIMEOUT
     L(f"[start] candidates={len(rows)} mode={mode} workers={workers} timeout={timeout}s")
     done = extracted = skipped = 0
     t0 = time.time()
