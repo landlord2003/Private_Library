@@ -2036,115 +2036,21 @@ def _http_get_json(url, timeout=5):
 _google_cooldown_until = 0.0  # Google Books 命中 429 后的冷却时间戳，避免共享 IP 连环限流
 
 def fetch_online_metadata(title, author=None, isbn=None, normalized_title=None):
-    """在线补全单本书元数据（豆瓣优先 + Open Library/Google Books 兜底，均无需 key）。
-    返回 dict: {publisher,publish_date,isbn,language,description,source,sim} 或 None。
-    仅用于填空字段；sim 为书名相似度，ISBN 命中时置 1.0。
-    说明：优先用已清洗的 normalized_title 作为检索查询（与预览一致、避免重复清洗）；
-    未配置 LIB_PROXY 国际代理时，Open Library/Google Books 在国内直连必超时，故跳过它们，
-    Douban 中文书直连即可，大幅提升批量速度。"""
-    global _google_cooldown_until
+    """在线补全单本书元数据。统一委托 tools/libtools_common.fetch_online_metadata
+    （Open Library 直连优先 -> Google Books 补充 -> 豆瓣仅 LIB_PROXY 配置时兜底），
+    与离线 meta_complete.py 共用同一真源，消除网页按钮与离线脚本的双逻辑不一致。
+    返回 dict 或 None。"""
     if not ENABLE_ONLINE_METADATA:
         return None
-    # 优先用已清洗的 normalized_title 作为检索查询
-    q = (normalized_title or "").strip() or (title or "").strip()
-    if not q and not isbn:
+    try:
+        _td = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools")
+        if _td not in sys.path:
+            sys.path.insert(0, _td)
+        import libtools_common as L
+        return L.fetch_online_metadata(title, author, isbn, normalized_title=normalized_title, detail=True)
+    except Exception as e:
+        print(f"[元数据委托失败·降级] {title[:24]}: {type(e).__name__}: {e}", flush=True)
         return None
-    result = None
-    best_sim = 0.0
-    # 0) 豆瓣（中文书最高优先级；覆盖出版社/出版年/ISBN/简介，命中率高）
-    try:
-        dm = _douban_meta(q, author, isbn)
-        if dm and dm.get("sim", 0) >= 0.5:
-            result = dm
-    except Exception as e:
-        print(f"[豆瓣失败] {q[:30]}: {e}", flush=True)
-    # 1) Open Library（英文/知名书补充源；仅在配置了 LIB_PROXY 国际代理时尝试，否则国内直连必超时）
-    _have_proxy = bool(os.environ.get("LIB_PROXY"))
-    try:
-        ol = None
-        if _have_proxy:
-            if isbn:
-                ol = _http_get_json("https://openlibrary.org/isbn/%s.json?jscmd=details&format=json" % isbn.replace("-",""), timeout=5)
-                best_sim = 1.0
-            if not ol and q:
-                s = _http_get_json("https://openlibrary.org/search.json?title=" + urllib.parse.quote(q)
-                                   + ("&author=" + urllib.parse.quote(author) if author else "") + "&limit=5", timeout=5)
-                docs = (s or {}).get("docs", [])
-                if docs:
-                    best = None; bs = 0.0
-                    for d in docs:
-                        sm = _sim(q, d.get("title",""))
-                        if sm > bs: bs = sm; best = d
-                    best_sim = bs
-                    if best:
-                        ol = best
-                        if str(best.get("key","")).startswith("/works/"):
-                            wk = _http_get_json("https://openlibrary.org" + best["key"] + ".json", timeout=5)
-                            if wk and isinstance(wk.get("description"), str):
-                                ol = dict(ol); ol["_desc"] = wk["description"]
-                            elif wk and isinstance(wk.get("description"), dict):
-                                ol = dict(ol); ol["_desc"] = wk["description"].get("value","")
-        else:
-            print(f"[OL跳过] 未配置 LIB_PROXY，跳过 Open Library（国内直连超时）: {q[:24]}", flush=True)
-        if ol:
-            pub = ol.get("publishers")
-            pub = pub[0] if isinstance(pub, list) and pub else ""
-            pd = ol.get("first_publish_year") or (ol.get("publish_date") if isinstance(ol.get("publish_date"), str) else "")
-            il = ol.get("isbn") if isinstance(ol.get("isbn"), list) else []
-            isbn2 = il[0] if il else ""
-            ll = ol.get("language") if isinstance(ol.get("language"), list) else []
-            lang = ll[0] if ll else ""
-            desc = ol.get("_desc") or (ol.get("description") if isinstance(ol.get("description"), str) else "")
-            if isinstance(desc, dict): desc = desc.get("value","")
-            if not result:
-                result = {"publisher": pub or "", "publish_date": str(pd) if pd else "",
-                          "isbn": isbn2 or "", "language": lang or "",
-                          "description": (desc or "")[:2000], "source": "openlibrary", "sim": best_sim}
-            else:
-                # 以豆瓣为主，Open Library 仅补全缺失字段
-                if not result.get("publisher"): result["publisher"] = pub or ""
-                if not result.get("publish_date"): result["publish_date"] = str(pd) if pd else ""
-                if not result.get("isbn"): result["isbn"] = isbn2 or ""
-                if not result.get("language"): result["language"] = lang or ""
-                if not result.get("description"): result["description"] = (desc or "")[:2000]
-                if best_sim > result.get("sim", 0): result["sim"] = best_sim
-    except Exception as e:
-        print(f"[OL失败] {title[:30]}: {e}", flush=True)
-    # 2) Google Books 兜底（仅在配置了 LIB_PROXY 时调用；未配置代理则直连超时，直接跳过）
-    try:
-        need_google = (not result) or (not result.get("description")) or (q and best_sim < 0.7)
-        if _have_proxy and need_google and time.time() > _google_cooldown_until:
-            gq = q + (" " + author if author else "")
-            g = _http_get_json("https://www.googleapis.com/books/v1/volumes?q=" + urllib.parse.quote(gq) + "&maxResults=5", timeout=5)
-            items = (g or {}).get("items", [])
-            if items:
-                vi = items[0].get("volumeInfo", {})
-                gdesc = vi.get("description","")
-                gsim = _sim(q, vi.get("title",""))
-                if (not result) or (gdesc and not result.get("description")) or (gsim > result.get("sim",0)):
-                    merged = dict(result) if result else {}
-                    gis = ""; ids = vi.get("industryIdentifiers", [])
-                    for i in ids:
-                        if i.get("type") in ("ISBN_13","ISBN_10"): gis = i.get("identifier",""); break
-                    merged.update({
-                        "publisher": vi.get("publisher","") or merged.get("publisher",""),
-                        "publish_date": vi.get("publishedDate","") or merged.get("publish_date",""),
-                        "isbn": gis or merged.get("isbn",""),
-                        "language": vi.get("language","") or merged.get("language",""),
-                        "description": gdesc or merged.get("description",""),
-                        "source": "googlebooks",
-                        "sim": max(gsim, merged.get("sim",0)),
-                    })
-                    merged["description"] = (merged["description"] or "")[:2000]
-                    result = merged
-    except Exception as e:
-        msg = str(e)
-        if "429" in msg:
-            _google_cooldown_until = time.time() + 120  # 命中限流，冷却 2 分钟，期间跳过 Google
-            print(f"[GB 429 冷却] {title[:20]}: 2分钟内跳过 Google", flush=True)
-        else:
-            print(f"[GB失败] {title[:30]}: {e}", flush=True)
-    return result
 
 def _fetch_meta_timeout(title, author, isbn, normalized_title=None, timeout=15):
     """在独立线程里跑 fetch_online_metadata，硬性超时返回 None，避免外部 API 挂死拖垮整批。"""
