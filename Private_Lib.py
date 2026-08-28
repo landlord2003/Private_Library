@@ -1610,7 +1610,7 @@ def run_summary_smart_async(limit=200):
             # 阶段2：真正有正文但无真摘要
             remain=lim-rv["done"]
             if remain>0:
-                miss=dbq("SELECT b.id,b.title,t.text_content FROM books b JOIN book_text t ON t.id=b.id WHERE b.status='active' AND b.text_extracted=1 AND (b.summary IS NULL OR b.summary='') LIMIT ?",(remain,))
+                miss=dbq("SELECT b.id,b.title,t.text_content FROM books b JOIN book_text t ON t.id=b.id WHERE b.status='active' AND b.text_extracted=1 AND (b.summary IS NULL OR b.summary='') AND length(t.text_content)>=50 LIMIT ?",(remain,))
                 rv["total"]+=len(miss)
                 for b in miss:
                     try:
