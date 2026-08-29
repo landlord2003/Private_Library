@@ -67,6 +67,10 @@ def main():
     limit = args.limit or cfg.get("default_limit", 200)
 
     conn = C.get_conn()
+    try:
+        conn.execute("PRAGMA busy_timeout=60000")  # 写锁等待提到60s，避免与Web服务偶发写冲突
+    except Exception:
+        pass
     pconn = C.get_progress_conn()
     C.ensure_progress(pconn)
 
@@ -145,8 +149,21 @@ def main():
         sets.append("metadata_source=?"); params.append(meta.get("source", ""))
         sets.append("metadata_conf=?"); params.append(round(sim, 2))
         params.append(bid)
-        conn.execute("UPDATE books SET " + ", ".join(sets) + " WHERE id=?", params)
-        conn.commit()
+        # 写库加锁重试：Web服务(8000)偶发写/长事务会持锁，撞 locked 不崩溃、等锁释放后继续
+        _written = False
+        for _att in range(30):
+            try:
+                conn.execute("UPDATE books SET " + ", ".join(sets) + " WHERE id=?", params)
+                conn.commit()
+                _written = True
+                break
+            except Exception as e:
+                if "locked" in str(e).lower():
+                    time.sleep(2)
+                    continue
+                raise
+        if not _written:
+            raise RuntimeError("books 写锁重试耗尽(30次)")
         if all_filled(conn, bid):
             C.mark_progress(pconn, bid, TOOL, "done")
             print(f"  [{i}/{len(rows)}] 完成✅ {b['title'][:26]} (sim {sim:.2f})", flush=True)

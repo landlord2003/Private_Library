@@ -19,6 +19,8 @@ __pycache__/
 _dup_log.txt
 _req_log.txt
 startup_log.txt
+tools/meta_*_log.txt
+tools/*_log.txt
 
 # === 临时文件 ===
 *.tmp
@@ -26,6 +28,8 @@ startup_log.txt
 *.swp
 *~
 _*.html
+tools/_*.py
+scripts/_*.py
 
 # === 修复脚本（一次性本地工具）===
 fix_permissions.bat

@@ -77,6 +77,92 @@ def dbq(sql, params=()):
     c.close()
     return r
 
+def _api_graph(qs):
+    """A 书目图谱：基于现有 categories/tags/authors 的实时关系聚合（只读，不写库）。
+    参数 focus(节点id) type(category|tag|author|book) limit(默认50,最大200)"""
+    ftype = (qs.get('type') or ['book'])[0]
+    focus = (qs.get('focus') or [''])[0]
+    try:
+        limit = min(int((qs.get('limit') or ['50'])[0]), 200)
+    except Exception:
+        limit = 50
+    nodes = []; edges = []; meta = {}
+    def add_node(nid, label, ntype, val):
+        if not any(n['id'] == nid for n in nodes):
+            nodes.append({'id': nid, 'label': label, 'type': ntype, 'val': val})
+    if not focus:
+        cats = dbq("SELECT c.id,c.name,COUNT(*) AS n FROM categories c JOIN book_categories bc ON bc.category_id=c.id GROUP BY c.id ORDER BY n DESC LIMIT 24")
+        for c in cats:
+            add_node('cat:%s' % c['id'], c['name'], 'category', c['n'])
+        meta = {'mode': 'overview', 'hint': '点击分类/标签/作者节点展开关系；点击书节点看详情'}
+        return {'nodes': nodes, 'edges': edges, 'meta': meta}
+    if ftype == 'book':
+        b = dbq("SELECT id,title FROM books WHERE id=?", (focus,))
+        if not b:
+            return {'nodes': [], 'edges': [], 'meta': {'error': 'book not found'}}
+        bid = focus
+        add_node('book:%s' % bid, b[0]['title'], 'book', 12)
+        for c in dbq("SELECT c.id,c.name FROM book_categories bc JOIN categories c ON c.id=bc.category_id WHERE bc.book_id=?", (bid,)):
+            add_node('cat:%s' % c['id'], c['name'], 'category', 3); edges.append({'source':'book:%s'%bid,'target':'cat:%s'%c['id']})
+        for t in dbq("SELECT t.id,t.name FROM book_tags bt JOIN tags t ON t.id=bt.tag_id WHERE bt.book_id=?", (bid,)):
+            add_node('tag:%s' % t['id'], t['name'], 'tag', 3); edges.append({'source':'book:%s'%bid,'target':'tag:%s'%t['id']})
+        for a in dbq("SELECT a.id,a.name FROM book_authors ba JOIN authors a ON a.id=ba.author_id WHERE ba.book_id=?", (bid,)):
+            add_node('auth:%s' % a['id'], a['name'], 'author', 3); edges.append({'source':'book:%s'%bid,'target':'auth:%s'%a['id']})
+        sib = dbq("SELECT b.id,b.title,COUNT(*) AS sh FROM book_tags bt JOIN book_tags bt2 ON bt2.tag_id=bt.tag_id JOIN books b ON b.id=bt2.book_id WHERE bt.book_id=? AND bt2.book_id<>? GROUP BY b.id ORDER BY sh DESC LIMIT ?", (bid, bid, limit))
+        for s in sib:
+            sid = 'book:%s' % s['id']
+            add_node(sid, s['title'], 'book', max(2, s['sh']))
+            edges.append({'source':'book:%s'%bid,'target':sid})
+        meta = {'mode': 'book', 'title': b[0]['title']}
+    elif ftype == 'category':
+        c = dbq("SELECT id,name FROM categories WHERE id=?", (focus,))
+        if not c: return {'nodes':[],'edges':[],'meta':{'error':'category not found'}}
+        add_node('cat:%s'%focus, c[0]['name'], 'category', 12)
+        books = dbq("SELECT b.id,b.title FROM book_categories bc JOIN books b ON b.id=bc.book_id WHERE bc.category_id=? ORDER BY b.title LIMIT ?", (focus, limit))
+        bids = [x['id'] for x in books]
+        for b in books:
+            add_node('book:%s'%b['id'], b['title'], 'book', 3); edges.append({'source':'cat:%s'%focus,'target':'book:%s'%b['id']})
+        if bids:
+            qm = ','.join('?'*len(bids))
+            for t in dbq("SELECT bt.tag_id,t.name,bt.book_id FROM book_tags bt JOIN tags t ON t.id=bt.tag_id WHERE bt.book_id IN (%s)" % qm, bids):
+                tid='tag:%s'%t['tag_id']; add_node(tid, t['name'], 'tag', 2); edges.append({'source':'book:%s'%t['book_id'],'target':tid})
+            for a in dbq("SELECT ba.author_id,a.name,ba.book_id FROM book_authors ba JOIN authors a ON a.id=ba.author_id WHERE ba.book_id IN (%s)" % qm, bids):
+                aid='auth:%s'%a['author_id']; add_node(aid, a['name'], 'author', 2); edges.append({'source':'book:%s'%a['book_id'],'target':aid})
+        meta = {'mode':'category','name':c[0]['name']}
+    elif ftype == 'tag':
+        t = dbq("SELECT id,name FROM tags WHERE id=?", (focus,))
+        if not t: return {'nodes':[],'edges':[],'meta':{'error':'tag not found'}}
+        add_node('tag:%s'%focus, t[0]['name'], 'tag', 12)
+        books = dbq("SELECT b.id,b.title FROM book_tags bt JOIN books b ON b.id=bt.book_id WHERE bt.tag_id=? ORDER BY b.title LIMIT ?", (focus, limit))
+        bids=[x['id'] for x in books]
+        for b in books:
+            add_node('book:%s'%b['id'], b['title'], 'book', 3); edges.append({'source':'tag:%s'%focus,'target':'book:%s'%b['id']})
+        if bids:
+            qm=','.join('?'*len(bids))
+            for c in dbq("SELECT bc.category_id,c.name,bc.book_id FROM book_categories bc JOIN categories c ON c.id=bc.category_id WHERE bc.book_id IN (%s)" % qm, bids):
+                cid='cat:%s'%c['category_id']; add_node(cid, c['name'], 'category', 2); edges.append({'source':'book:%s'%c['book_id'],'target':cid})
+            for a in dbq("SELECT ba.author_id,a.name,ba.book_id FROM book_authors ba JOIN authors a ON a.id=ba.author_id WHERE ba.book_id IN (%s)" % qm, bids):
+                aid='auth:%s'%a['author_id']; add_node(aid, a['name'], 'author', 2); edges.append({'source':'book:%s'%a['book_id'],'target':aid})
+        meta={'mode':'tag','name':t[0]['name']}
+    elif ftype == 'author':
+        a = dbq("SELECT id,name FROM authors WHERE id=?", (focus,))
+        if not a: return {'nodes':[],'edges':[],'meta':{'error':'author not found'}}
+        add_node('auth:%s'%focus, a[0]['name'], 'author', 12)
+        books = dbq("SELECT b.id,b.title FROM book_authors ba JOIN books b ON b.id=ba.book_id WHERE ba.author_id=? ORDER BY b.title LIMIT ?", (focus, limit))
+        bids=[x['id'] for x in books]
+        for b in books:
+            add_node('book:%s'%b['id'], b['title'], 'book', 3); edges.append({'source':'auth:%s'%focus,'target':'book:%s'%b['id']})
+        if bids:
+            qm=','.join('?'*len(bids))
+            for c in dbq("SELECT bc.category_id,c.name,bc.book_id FROM book_categories bc JOIN categories c ON c.id=bc.category_id WHERE bc.book_id IN (%s)" % qm, bids):
+                cid='cat:%s'%c['category_id']; add_node(cid, c['name'], 'category', 2); edges.append({'source':'book:%s'%c['book_id'],'target':cid})
+            for t in dbq("SELECT bt.tag_id,t.name,bt.book_id FROM book_tags bt JOIN tags t ON t.id=bt.tag_id WHERE bt.book_id IN (%s)" % qm, bids):
+                tid='tag:%s'%t['tag_id']; add_node(tid, t['name'], 'tag', 2); edges.append({'source':'book:%s'%t['book_id'],'target':tid})
+        meta={'mode':'author','name':a[0]['name']}
+    else:
+        meta = {'error': 'unknown type'}
+    return {'nodes': nodes, 'edges': edges, 'meta': meta}
+
 def dbe(sql, params=()):
     c = sqlite3.connect(DB, timeout=10)
     c.execute(sql, params)
@@ -219,6 +305,7 @@ def _tool_center_html():
     h += '<a class=sb href="/?p=stats"><div class=n style="color:#52c41a">%d</div><div class=l>📄 已抽全文</div></a>' % cov.get('text_extracted',0)
     h += '<a class=sb href="/?p=stats"><div class=n style="color:#fa8c16">%d</div><div class=l>🧬 图谱L1已生成</div></a>' % tools.get('kg',{}).get('done',0)
     h += '<a class=sb href="/?p=stats"><div class=n style="color:#c0392b">%d</div><div class=l>⚠️ 待修假摘要</div></a>' % fake
+    h += '<a class=sb href="/graph"><div class=n style="color:#722ed1">%d</div><div class=l>🕸 知识图谱浏览器</div></a>' % tb
     h += '</div></div>'
     # 离线批处理
     h += '<div style="display:flex;flex-wrap:wrap;margin-top:6px">'
@@ -2836,18 +2923,22 @@ class H(http.server.SimpleHTTPRequestHandler):
                     _pr = dbq("SELECT last_page FROM books WHERE id=?",(bid,))
                     _start = int(_pr[0]['last_page']) if (_pr and _pr[0]['last_page']) else 0
                     viewer = '''<!DOCTYPE html><html><head><meta charset=utf-8>
-<meta name="color-scheme" content="light only">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>__TITLE__</title>
+<script>try{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 <style>
+:root{--bg:#fff;--text:#222;--toolbar:#20232a;--toolbar-btn:#3a3f4b;--toolbar-btn-hover:#4a5160;--muted:#bbb;color-scheme:light dark}
+[data-theme="dark"]{--bg:#1a1c20;--text:#e6e8eb;--toolbar:#16181d;--toolbar-btn:#2c3038;--toolbar-btn-hover:#353a44;--muted:#8a9099}
 *{box-sizing:border-box}
-html,body{margin:0;height:100%;background:#fff;color:#222;font-family:system-ui,'Segoe UI',sans-serif}
-#toolbar{position:fixed;top:0;left:0;right:0;height:48px;display:flex;align-items:center;gap:8px;padding:0 12px;background:#20232a;color:#fff;z-index:10}
-#toolbar button,#toolbar select{background:#3a3f4b;color:#fff;border:none;border-radius:6px;padding:6px 10px;cursor:pointer;font-size:13px}
-#toolbar button:hover,#toolbar select:hover{background:#4a5160}
-#content{position:fixed;top:48px;left:0;right:0;bottom:0;overflow:auto;padding:24px;max-width:900px;margin:0 auto;line-height:1.9;font-size:18px}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font-family:system-ui,'Segoe UI',sans-serif}
+#toolbar{position:fixed;top:0;left:0;right:0;height:48px;display:flex;align-items:center;gap:8px;padding:0 12px;background:var(--toolbar);color:#fff;z-index:10}
+#toolbar button,#toolbar select{background:var(--toolbar-btn);color:#fff;border:none;border-radius:6px;padding:6px 10px;cursor:pointer;font-size:13px}
+#toolbar button:hover,#toolbar select:hover{background:var(--toolbar-btn-hover)}
+#content{position:fixed;top:48px;left:0;right:0;bottom:0;overflow:auto;padding:24px;max-width:900px;margin:0 auto;line-height:1.9;font-size:18px;background:#fff}
 #content img{max-width:100%}
 .spacer{flex:1}
-.prog{font-size:12px;color:#bbb}
+.prog{font-size:12px;color:var(--muted)}
 </style></head><body>
 <div id="toolbar">
 <button onclick="prev()">◀ 上一章</button>
@@ -3027,19 +3118,22 @@ loadInfo();
                     if ext == '.pdf' and not raw_mode:
                         raw_url = path + ('&raw=1' if p.query else '?raw=1')
                         viewer = '''<!DOCTYPE html><html><head><meta charset=utf-8>
-<meta name="color-scheme" content="light only">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>''' + he(inner_fn) + '''</title>
+<script>try{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 <style>
-:root{color-scheme:light only}
+:root{--bg:#f0f0f0;--text:#222;--toolbar:#3b3b3b;--toolbar-btn:#555;--toolbar-btn-hover:#777;--toolbar-text:#ccc;--pagebg:#fff;--input-bg:#555;--input-bd:#777;color-scheme:light dark}
+[data-theme="dark"]{--bg:#16181d;--text:#e6e8eb;--toolbar:#16181d;--toolbar-btn:#2c3038;--toolbar-btn-hover:#353a44;--toolbar-text:#8a9099;--pagebg:#0e0f12;--input-bg:#2c3038;--input-bd:#3a3f4b}
 *{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%;background:#f0f0f0;overflow:hidden;font-family:sans-serif}
-#toolbar{position:fixed;top:0;left:0;right:0;height:44px;background:#3b3b3b;display:flex;align-items:center;padding:0 12px;z-index:100;gap:8px}
-#toolbar button{background:#555;color:#fff;border:none;border-radius:4px;padding:5px 12px;cursor:pointer;font-size:13px}
-#toolbar button:hover{background:#777}
-#toolbar span{color:#ccc;font-size:13px}
-#pageNum{width:50px;text-align:center;background:#555;color:#fff;border:1px solid #777;border-radius:3px;padding:3px 6px;font-size:13px}
+html,body{height:100%;background:var(--bg);overflow:hidden;font-family:sans-serif}
+#toolbar{position:fixed;top:0;left:0;right:0;height:44px;background:var(--toolbar);display:flex;align-items:center;padding:0 12px;z-index:100;gap:8px}
+#toolbar button{background:var(--toolbar-btn);color:#fff;border:none;border-radius:4px;padding:5px 12px;cursor:pointer;font-size:13px}
+#toolbar button:hover{background:var(--toolbar-btn-hover)}
+#toolbar span{color:var(--toolbar-text);font-size:13px}
+#pageNum{width:50px;text-align:center;background:var(--input-bg);color:#fff;border:1px solid var(--input-bd);border-radius:3px;padding:3px 6px;font-size:13px}
 #canvasWrap{margin-top:44px;height:calc(100% - 44px);overflow:auto;display:flex;justify-content:center}
-#pdfCanvas{background:#fff;box-shadow:0 2px 8px rgba(0,0,0,0.3)}
+#pdfCanvas{background:var(--pagebg);box-shadow:0 2px 8px rgba(0,0,0,0.3)}
 </style></head><body>
 <div id="toolbar">
 <button onclick="prevPage()">◀ 上一页</button>
@@ -3159,6 +3253,21 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             elif path == "/api/categories":
                 rows = dbq("SELECT id, name FROM categories ORDER BY name")
                 self.json([dict(r) for r in rows])
+            elif path == "/api/graph":
+                self.json(_api_graph(qs)); return
+            elif path == "/api/search":
+                q = (qs.get('q') or [''])[0]
+                rows = dbq("SELECT id,title FROM books WHERE title LIKE ? ORDER BY title LIMIT 20", ('%'+q+'%',)) if q else []
+                self.json([dict(r) for r in rows]); return
+            elif path in ("/graph", "/graph.html"):
+                base = os.path.dirname(os.path.abspath(__file__))
+                gf = os.path.join(base, "graph.html")
+                if os.path.exists(gf):
+                    self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.end_headers()
+                    with open(gf,'rb') as f: self.wfile.write(f.read())
+                else:
+                    self.send_error(404)
+                return
             else:
                 self._page(qs)
         except Exception as e:

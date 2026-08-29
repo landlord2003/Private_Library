@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>知识图谱浏览器 · 书目关系漫游</title>
+<script>try{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+<style>
+  :root{--bg:#f6f7fb;--text:#222;--panel:#fff;--border:#e3e3e3;--shadow:rgba(0,0,0,.12);--muted:#888;--primary:#722ed1;--hover:#f3edff;--tip-bg:#222;--tip-fg:#fff;color-scheme:light dark}
+  [data-theme="dark"]{--bg:#16181d;--text:#e6e8eb;--panel:#21242b;--border:#2c3038;--shadow:rgba(0,0,0,.5);--muted:#8a9099;--primary:#9d6bff;--hover:#2a2336;--tip-bg:#e6e8eb;--tip-fg:#16181d}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;font-family:system-ui,'Segoe UI','Microsoft YaHei',sans-serif;background:var(--bg);color:var(--text)}
+  #top{position:fixed;top:0;left:0;right:0;height:56px;display:flex;align-items:center;gap:10px;padding:0 14px;background:var(--panel);border-bottom:1px solid var(--border);z-index:10}
+  #top h1{font-size:16px;margin:0;color:var(--primary);white-space:nowrap}
+  #search{flex:1;max-width:320px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;font-size:14px;background:var(--panel);color:var(--text)}
+  #search:focus{outline:none;border-color:var(--primary)}
+  .btn{background:var(--primary);color:#fff;border:none;border-radius:8px;padding:8px 12px;font-size:13px;cursor:pointer}
+  .btn:hover{filter:brightness(1.12)}
+  .btn.ghost{background:var(--panel);color:var(--primary);border:1px solid var(--primary)}
+  #legend{display:flex;gap:12px;font-size:12px;color:var(--muted);align-items:center}
+  .lg{display:inline-flex;align-items:center;gap:4px}
+  .dot{width:11px;height:11px;border-radius:50%;display:inline-block}
+  #status{position:fixed;bottom:10px;left:14px;font-size:12px;color:var(--muted);background:var(--panel);border:1px solid var(--border);padding:4px 8px;border-radius:6px;z-index:10}
+  #canvas{position:fixed;top:56px;left:0;right:0;bottom:0;display:block;cursor:grab}
+  #results{position:fixed;top:56px;left:14px;background:var(--panel);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 16px var(--shadow);max-width:340px;max-height:60vh;overflow:auto;z-index:20;display:none}
+  #results div{padding:9px 12px;font-size:13px;border-bottom:1px solid var(--border);cursor:pointer;color:var(--text)}
+  #results div:hover{background:var(--hover)}
+  #tip{position:fixed;pointer-events:none;background:var(--tip-bg);color:var(--tip-fg);font-size:12px;padding:4px 8px;border-radius:6px;z-index:30;display:none;max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  @media(max-width:600px){
+    #top{height:auto;min-height:56px;flex-wrap:wrap;padding:8px 10px}
+    #top h1{font-size:15px}
+    #search{order:3;flex:1 1 100%;max-width:none}
+    .btn{order:1}
+    #legend{order:2;font-size:11px;gap:8px}
+    #results{left:8px;right:8px;max-width:none;max-height:50vh}
+    #canvas{top:104px}
+  }
+</style>
+</head>
+<body>
+<div id="top">
+  <h1>🕸 知识图谱</h1>
+  <input id="search" placeholder="搜书名 → 回车，点结果进入该书关系网" onkeydown="if(event.key==='Enter')doSearch()">
+  <button class="btn" onclick="doSearch()">搜索</button>
+  <button class="btn ghost" onclick="loadGraph({})">总览</button>
+  <div id="legend">
+    <span class="lg"><i class="dot" style="background:#1677ff"></i>书</span>
+    <span class="lg"><i class="dot" style="background:#722ed1"></i>分类</span>
+    <span class="lg"><i class="dot" style="background:#52c41a"></i>标签</span>
+    <span class="lg"><i class="dot" style="background:#fa8c16"></i>作者</span>
+  </div>
+</div>
+<div id="results"></div>
+<canvas id="canvas"></canvas>
+<div id="status">加载中…</div>
+<div id="tip"></div>
+<script>
+var COLORS={book:'#1677ff',category:'#722ed1',tag:'#52c41a',author:'#fa8c16'};
+var cv=document.getElementById('canvas'), ctx=cv.getContext('2d');
+var nodes=[], edges=[], byId={};
+var cam={x:0,y:0,scale:1};
+var drag=null, panning=false, last=null, hover=null, alpha=1;
+function resize(){cv.width=window.innerWidth;cv.height=window.innerHeight-56;ctx&&(cv.style.cursor='grab');}
+window.addEventListener('resize',resize); resize();
+
+function radius(n){return Math.max(4,Math.min(26,Math.sqrt((n.val||1))*3.2));}
+
+function loadGraph(params){
+  var q=[]; for(var k in params){ if(params[k]!==''&&params[k]!=null) q.push(encodeURIComponent(k)+'='+encodeURIComponent(params[k])); }
+  setStatus('请求中…');
+  fetch('/api/graph'+(q.length?'?'+q.join('&'):'')).then(function(r){return r.json();}).then(function(d){
+    if(d.meta&&d.meta.error){setStatus('⚠️ '+d.meta.error);return;}
+    setStatus(modeText(d.meta)+(d.meta&&d.meta.hint?' · '+d.meta.hint:''));
+    var old={}; nodes.forEach(function(n){old[n.id]=n;});
+    nodes=d.nodes||[]; edges=d.edges||[]; byId={};
+    nodes.forEach(function(n){
+      n.r=radius(n); n.fx=null; n.fy=null;
+      if(old[n.id]){n.x=old[n.id].x;n.y=old[n.id].y;n.vx=0;n.vy=0;}
+      else{var a=Math.random()*6.28,rr=120+Math.random()*160; n.x=Math.cos(a)*rr; n.y=Math.sin(a)*rr; n.vx=0; n.vy=0;}
+      byId[n.id]=n;
+    });
+    alpha=1; simulation();
+  }).catch(function(e){setStatus('请求失败: '+e);});
+}
+function modeText(m){if(!m)return'';if(m.mode==='overview')return'总览：点击分类展开';if(m.mode==='book')return'《'+(m.title||'')+'》的关系网';if(m.mode==='category')return'分类「'+(m.name||'')+'」';if(m.mode==='tag')return'标签「'+(m.name||'')+'」';if(m.mode==='author')return'作者「'+(m.name||'')+'」';return'';}
+function setStatus(t){document.getElementById('status').textContent=t;}
+
+function simulation(){
+  var i,j,n=N=nodes.length;
+  // 斥力
+  for(i=0;i<n;i++){for(j=i+1;j<n;j++){
+    var a=nodes[i],b=nodes[j]; var dx=a.x-b.x,dy=a.y-b.y; var d2=dx*dx+dy*dy+0.01; var f=900/d2;
+    var d=Math.sqrt(d2); var ux=dx/d,uy=dy/d;
+    a.vx+=ux*f; a.vy+=uy*f; b.vx-=ux*f; b.vy-=uy*f;
+  }}
+  // 弹簧
+  for(i=0;i<edges.length;i++){var e=edges[i]; var s=byId[e.source],t=byId[e.target]; if(!s||!t)continue;
+    var dx=t.x-s.x,dy=t.y-s.y; var d=Math.sqrt(dx*dx+dy*dy)+0.01; var rest=70; var f=(d-rest)*0.02;
+    var ux=dx/d,uy=dy/d; s.vx+=ux*f; s.vy+=uy*f; t.vx-=ux*f; t.vy-=uy*f;
+  }
+  // 向心 + 积分
+  for(i=0;i<n;i++){var p=nodes[i]; p.vx+=-p.x*0.002; p.vy+=-p.y*0.002;
+    if(p===drag){p.vx=0;p.vy=0;continue;}
+    p.vx*=0.85; p.vy*=0.85; p.x+=p.vx*alpha; p.y+=p.vy*alpha;
+  }
+  alpha*=0.992; if(alpha<0.04)alpha=0.04;
+  draw();
+  if(alpha>0.05) requestAnimationFrame(simulation);
+}
+function draw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.save(); ctx.translate(cv.width/2+cam.x, (cv.height)/2+cam.y); ctx.scale(cam.scale,cam.scale);
+  ctx.lineWidth=0.6/cam.scale;
+  for(var i=0;i<edges.length;i++){var e=edges[i];var s=byId[e.source],t=byId[e.target];if(!s||!t)continue;
+    ctx.strokeStyle='rgba(120,120,140,0.28)'; ctx.beginPath(); ctx.moveTo(s.x,s.y); ctx.lineTo(t.x,t.y); ctx.stroke();}
+  for(i=0;i<nodes.length;i++){var p=nodes[i];
+    ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,6.2832); ctx.fillStyle=COLORS[p.type]||'#888'; ctx.fill();
+    if(p===hover){ctx.strokeStyle='#222';ctx.lineWidth=2/cam.scale;ctx.stroke();}
+    if(p.r>9){ctx.fillStyle='#222';ctx.font=(Math.max(9,p.r*0.7))+'px sans-serif';ctx.textAlign='center';ctx.textBaseline='top';
+      var lab=(p.label||'').length>10?(p.label.slice(0,10)+'…'):p.label; ctx.fillText(lab,p.x,p.y+p.r+2);}
+  }
+  ctx.restore();
+}
+function screenToWorld(mx,my){return {x:(mx-cv.width/2-cam.x)/cam.scale, y:(my-cv.height/2-cam.y)/cam.scale};}
+function pick(mx,my){var w=screenToWorld(mx,my); for(var i=0;i<nodes.length;i++){var p=nodes[i];var dx=p.x-w.x,dy=p.y-w.y; if(dx*dx+dy*dy<=(p.r+3)*(p.r+3))return p;} return null;}
+
+cv.addEventListener('mousedown',function(e){var p=pick(e.offsetX,e.offsetY); if(p){drag=p;} else {panning=true;last={x:e.offsetX,y:e.offsetY};cv.style.cursor='grabbing';}});
+cv.addEventListener('mousemove',function(e){
+  var p=pick(e.offsetX,e.offsetY); hover=p;
+  if(drag){var w=screenToWorld(e.offsetX,e.offsetY); drag.x=w.x;drag.y=w.y;drag.vx=0;drag.vy=0;alpha=Math.max(alpha,0.3);}
+  else if(panning){cam.x+=e.offsetX-last.x;cam.y+=e.offsetY-last.y;last={x:e.offsetX,y:e.offsetY};}
+  if(p){var tip=document.getElementById('tip');tip.textContent=p.label;tip.style.display='block';tip.style.left=(e.clientX+12)+'px';tip.style.top=(e.clientY+12)+'px';}
+  else document.getElementById('tip').style.display='none';
+  if(!panning&&!drag)draw();
+});
+window.addEventListener('mouseup',function(){if(drag){var t=drag;drag=null;onClickNode(t);} panning=false; cv.style.cursor='grab';});
+cv.addEventListener('wheel',function(e){e.preventDefault();var f=e.deltaY<0?1.1:0.9;cam.scale=Math.max(0.2,Math.min(4,cam.scale*f));draw();},{passive:false});
+cv.addEventListener('click',function(e){/* 交由 mouseup 处理节点点击 */});
+
+function onClickNode(p){
+  if(!p)return;
+  var parts=p.id.split(':'); var type=parts[0], id=parts.slice(1).join(':');
+  if(type==='book'){ window.open('/?p=detail&id='+encodeURIComponent(id),'_blank'); }
+  else { loadGraph({type:type, focus:id}); }
+}
+function doSearch(){
+  var q=document.getElementById('search').value.trim(); if(!q)return;
+  fetch('/api/search?q='+encodeURIComponent(q)).then(function(r){return r.json();}).then(function(rows){
+    var box=document.getElementById('results'); box.innerHTML='';
+    if(!rows.length){box.innerHTML='<div>无匹配</div>';box.style.display='block';return;}
+    rows.forEach(function(r){var d=document.createElement('div');d.textContent=r.title;
+      d.onclick=function(){box.style.display='none';loadGraph({type:'book',focus:r.id});};box.appendChild(d);});
+    box.style.display='block';
+  });
+}
+document.getElementById('search').addEventListener('blur',function(){setTimeout(function(){document.getElementById('results').style.display='none';},200);});
+loadGraph({});
+</script>
+</body>
+</html>
