@@ -312,13 +312,13 @@ def _tool_center_html():
     h += '<div style="width:100%;font-weight:700;margin:10px 6px 0;color:#722ed1">⚙️ 离线批处理工具（tools/，可续跑）</div>'
     ext_n = cov.get('text_extracted',0)
     h += card('📄','提取文本',
-        '抽取 PDF/EPUB/MOBI/TXT 正文存入 book_text，供 AI 摘要、知识图谱、全文检索。PDF 仅取前 5–30 页、上限 20 万字；&gt;50MB 大文件与无 tesseract 的扫描版回落书名。',
+        '抽取 PDF/EPUB/MOBI/TXT 正文存入 book_text，供 AI 摘要、知识图谱、全文检索。PDF 仅取前 5–30 页、上限 20 万字；&gt;1500MB 超大文件回落书名；其余扫描版先 Unlimited-OCR、tesseract 兜底。',
         '%d / %d 本 (%.1f%%)' % (ext_n, total, pct(ext_n)), ext_n, '#52c41a',
         '/?p=stats', '查看全文提取覆盖率',
         '<button class=btn onclick="EXTR()">▶ 全量抽取(续跑)</button> <span id=extRes></span>')
     ocr_n = cov.get('ocr_pending',0)
     h += card('📷','扫描版OCR',
-        '对「已抽但正文极短(疑似书名兜底)」的扫描版PDF，用本机 tesseract+chi_sim 重新OCR识别，解锁无文字层书籍的正文。需本机已装 tesseract（tools/install_tesseract.bat）。',
+        '对「已抽但正文极短(疑似书名兜底)」的扫描版PDF，优先用本机 Unlimited-OCR(DeepSeek-OCR 谱系, 见 E:/Workbuddy/Unlimited-OCR)抽取无文字层书籍正文, 缺失时回落 tesseract+chi_sim(需 tools/install_tesseract.bat)。',
         '待OCR重抽 %d 本' % ocr_n, max(0, ocr_n), '#eb2f96',
         '/?p=stats', '查看全文提取覆盖率',
         '<button class=btn onclick="EXTR_OCR()">▶ OCR 重抽扫描版</button> <span id=ocrRes></span>')
@@ -1428,6 +1428,35 @@ def _ocr_pdf(file_path, max_pages=15):
         print(f"[OCR异常] {file_path}: {e}", flush=True)
         return ""
 
+def _ocr_unlimited(file_path, max_pages=20):
+    """Unlimited-OCR(DeepSeek-OCR 谱系)抽取扫描版/超大图 PDF 正文, 专治本库 >32767px 超大扫描书(tesseract 直接崩)。
+
+    通过 subprocess 调用独立 venv 的 uocr_cli.py(与 Private_Lib 的受管 Python/环境变量隔离)。
+    WorkBuddy 注入的 PYTHONPATH(含 safe-delete shim) 与 ACC_PRODUCT_CONFIG_V3 会干扰子进程 torch 加载, 必须清除。
+    返回过滤后的纯正文(text/title/header/footer); 失败/不可用返回 ''。"""
+    import subprocess as _sp, os as _os, re as _re
+    cli = r"E:\Workbuddy\Unlimited-OCR\uocr_cli.py"
+    vpy = r"E:\Workbuddy\Unlimited-OCR\.venv_uocr\Scripts\python.exe"
+    if not (_os.path.exists(cli) and _os.path.exists(vpy)):
+        return ""
+    try:
+        env = dict(_os.environ)
+        env.pop("PYTHONPATH", None)
+        env.pop("ACC_PRODUCT_CONFIG_V3", None)
+        env.pop("PYTHONHOME", None)
+        r = _sp.run([vpy, cli, file_path, str(max_pages)], capture_output=True, timeout=1800, env=env)
+        if r.returncode != 0:
+            print(f"[Unlimited-OCR失败] {file_path}: rc={r.returncode} {r.stderr.decode('utf-8','ignore')[:200]}", flush=True)
+            return ""
+        raw = r.stdout.decode("utf-8", "ignore")
+        keep = ("text", "title", "header", "footer")
+        parts = _re.findall(r"<\|det\|>(" + "|".join(keep) + r") [^<]*<\|/det\|>([^<]*)", raw)
+        joined = " ".join(p[1].strip() for p in parts if p[1].strip())
+        return joined
+    except Exception as e:
+        print(f"[Unlimited-OCR异常] {file_path}: {e}", flush=True)
+        return ""
+
 def extract_text_for(book_id, file_path, fmt):
     try:
         file_path = _resolve_path(file_path)
@@ -1439,8 +1468,9 @@ def extract_text_for(book_id, file_path, fmt):
         fsize = meta[0]['file_size'] if meta and meta[0]['file_size'] else 0
         size_mb = fsize / 1024 / 1024
         title_short = meta[0]['title'][:40] if meta else '?'
-        # Large files (>50MB): skip extraction, use title fallback
-        if size_mb > 50:
+        # Large files (>1500MB): skip extraction, use title fallback
+        # (1500MB 以下的大扫描 PDF 交由下方 OCR 分支用 Unlimited-OCR 抽取正文)
+        if size_mb > 1500:
             print(f"[跳过大文件] {size_mb:.0f}MB {fmt} {title_short}", flush=True)
             return _title_fallback(book_id)
         text = ""
@@ -1455,15 +1485,20 @@ def extract_text_for(book_id, file_path, fmt):
                 if i >= max_pages: break
                 text += page.get_text()
             doc.close()
-            # Scanned PDF fallback: try OCR, then title
+            # Scanned PDF fallback: 先 Unlimited-OCR(专治超大扫描/无文字层), 再 tesseract 兜底
             if not text.strip():
-                ocr = _ocr_pdf(file_path, max_pages=15)
-                if ocr.strip():
-                    text = ocr
-                    print(f"[扫描版PDF] OCR 获取 {len(ocr)} 字: {title_short}", flush=True)
+                u = _ocr_unlimited(file_path, max_pages=20)
+                if u.strip():
+                    text = u
+                    print(f"[扫描版PDF] Unlimited-OCR 获取 {len(u)} 字: {title_short}", flush=True)
                 else:
-                    print(f"[扫描版PDF] 无文字层且OCR不可用, 用书名兜底: {title_short}", flush=True)
-                    return _title_fallback(book_id)
+                    ocr = _ocr_pdf(file_path, max_pages=15)
+                    if ocr.strip():
+                        text = ocr
+                        print(f"[扫描版PDF] tesseract OCR 获取 {len(ocr)} 字: {title_short}", flush=True)
+                    else:
+                        print(f"[扫描版PDF] 无文字层且OCR不可用, 用书名兜底: {title_short}", flush=True)
+                        return _title_fallback(book_id)
         elif fmt == 'epub':
             # Use zipfile to read EPUB directly (more robust than ebooklib)
             import zipfile

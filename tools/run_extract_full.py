@@ -35,7 +35,7 @@ def main():
         # 适用场景：装好 tesseract+chi_sim 后，把之前因无 OCR 而回落书名的扫描版 PDF 重新识别。
         # 关键修正：回落空壳时 _title_fallback 把 text_extracted 置为 0(非空壳标题行),故必须包含 text_extracted=0，
         #          否则那些书永远不在候选里、OCR 补不回来。
-        # 注意：>50MB 大文件在 extract_text_for 内仍走跳过逻辑(不 OCR)，故超大扫描版需另行处理。
+        # 注意：>1500MB 超大文件在 extract_text_for 内仍走跳过逻辑(不 OCR)，1500MB 以下的大扫描版已由 Unlimited-OCR 抽取。
         q = """SELECT b.id,b.file_path,b.file_format FROM books b
                JOIN book_text bt ON bt.id=b.id
                WHERE b.status='active' AND b.file_format='pdf'
@@ -48,11 +48,12 @@ def main():
                WHERE b.status='active' AND b.text_extracted<>1"""
     rows = con.execute(q).fetchall()
     con.close()
-    # 大文件预标记：>50MB 的文件在 extract_text_for 内走跳过逻辑(不抽正文，仅回落书名)，
+    # 大文件预标记：>1500MB 的文件在 extract_text_for 内走跳过逻辑(不抽正文，仅回落书名)，
     # 但不会置 text_extracted=1，导致续跑/OCR 模式反复把它们重选进来死循环。
     # 这里一次性标记为大文件已处理(置 text_extracted=1, 空正文)，移出候选集，
     # 两种模式(全量/ocr)都排除，避免对超大扫描版反复抽。
-    BIG = 50 * 1024 * 1024
+    # 注：1500MB 以下的超大扫描 PDF 已交由 Unlimited-OCR 抽取(见 Private_Lib._ocr_unlimited)。
+    BIG = 1500 * 1024 * 1024
     big_ids, real_rows = [], []
     for r in rows:
         try:
@@ -68,7 +69,9 @@ def main():
         L(f"[skip-big] marked {len(big_ids)} files >50MB as processed (excluded from resume/ocr)")
     rows = real_rows
     # OCR 模式并发可经 OCR_WORKERS 覆盖(默认4);超时 OCR_WORKERS_TIMEOUT(默认180)
-    workers = int(os.environ.get("OCR_WORKERS", "4")) if mode == "ocr" else WORKERS
+    # Unlimited-OCR 为 GPU 重负载(单本占 ~6.8GB 显存), OCR 批量默认并发=1, 避免多进程抢显存 OOM。
+    # 仅有 tesseract(CPU) 的环境可用 OCR_WORKERS=4 提速。
+    workers = int(os.environ.get("OCR_WORKERS", "1")) if mode == "ocr" else WORKERS
     timeout = int(os.environ.get("OCR_WORKERS_TIMEOUT", "180")) if mode == "ocr" else PER_BOOK_TIMEOUT
     L(f"[start] candidates={len(rows)} mode={mode} workers={workers} timeout={timeout}s")
     done = extracted = skipped = 0
