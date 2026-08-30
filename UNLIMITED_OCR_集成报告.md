@@ -120,7 +120,20 @@ def _ocr_unlimited(file_path, max_pages=20):
 - **分页**：`infer_multi` 一次吃 N 页合一序列，`max_pages=20` 较稳；超长书按 20 页/次循环调用（CLI 每次重加载模型 ~4s，可接受）。
 - **显存**：OCR 时占 6.8GB；图书馆后端本身是 CPU/FastAPI，与 OCR 的 GPU 占用不冲突（subprocess 结束即释放）。
 - **时长估算**：样本 50MB/6 页 ≈ 70s → 一本 200 页扫描书（10 次调用）约 12–15 分钟；4538 本建议**夜间分批 + 并发数=1**（GPU 单卡，勿并行多进程抢显存）。
-- **输出**：`uocr_cli.py` 输出含 `<|det|>类型 [bbox]<|/det|>` 版面标记 + 正文的 markdown。若只要纯文本，按 `<|det|>` 块过滤文本类（text/title/header/footer）即可，或后续用正则剥离标签。
+- **输出**：`uocr_cli.py` 输出含 `<|det|>类型 [bbox]<|/det|>` 版面标记 + 正文的 markdown。若只要纯文本，用下面这段正则剥离即可（与 MCP 层 `cleanText()` 等价，已实测）：
+
+```python
+import re
+def clean_ocr(raw: str) -> str:
+    s = re.sub(r"^\s*warning:.*$", "", raw, flags=re.I | re.M)   # 滤库警告
+    s = s.replace("<PAGE>", "\n\n----- page -----\n")            # 页分隔
+    s = re.sub(r"<\|det\|>\s*image\s*\[[^\]]*\]\s*<\|/det\|>", "[图]", s, flags=re.I)
+    s = re.sub(r"<\|det\|>[^<]*?<\|/det\|>", "", s)              # 去版面标记
+    s = re.sub(r"<\|[^>]*\|>", "", s)                            # 兜底残留 token
+    return re.sub(r"\n{3,}", "\n\n", s).strip()
+```
+
+  清洗前 2836 字 → 清洗后 1982 字（纯正文，正文零丢失）。
 
 ---
 
@@ -130,3 +143,59 @@ def _ocr_unlimited(file_path, max_pages=20):
 2. 跑 OCR 的 Python **必须清掉 `PYTHONPATH` 与 `ACC_PRODUCT_CONFIG_V3`**（WorkBuddy 注入的 shim 会干扰子进程），CLI 已假设干净环境；若在 WorkBuddy 内调用，确保 subprocess 环境已 unset。
 3. 模型自定义代码受 `trust_remote_code=True` 加载，已审计无外联/无执行副作用；如需升级模型，重新从 ModelScope 拉 `PaddlePaddle/Unlimited-OCR` 并复查 `modeling_*.py`。
 4. 本机无 SkillManage 写入通道，部署脚本与报告存于 `E:/Workbuddy/Unlimited-OCR/` 与 `G:/my-library/`，供团队接手。
+
+---
+
+## 九、WorkBuddy MCP 连接器（已接入，AI 助手可直接调用）
+
+除了给图书馆代码用的 CLI，同一套 OCR 能力已封装成 **MCP stdio 连接器**，让 WorkBuddy 里的 AI 助手直接调用（无需写代码）。
+
+### 配置（已写入 `C:\Users\Lenovo\.workbuddy\mcp.json`）
+
+```json
+"unlimited-ocr": {
+  "command": "C:\\Users\\Lenovo\\.workbuddy\\binaries\\node\\versions\\22.22.2\\node.exe",
+  "args": ["E:\\Workbuddy\\Unlimited-OCR\\uocr_mcp.js"],
+  "disabled": false
+}
+```
+
+> 新增连接器不会自动激活：需在连接器管理页右上角的自定义连接器入口点一次 **信任(Trust)**。
+
+### 暴露的 3 个工具
+
+| 工具 | 参数 | 说明 |
+|---|---|---|
+| `ocr_pdf` | `pdf_path`, `max_pages`(默认5), `layout`(默认false) | 扫描 PDF → markdown 正文 |
+| `ocr_image` | `image_path`, `layout` | 单张图片(png/jpg/bmp/webp/tif) → 文本 |
+| `check_status` | 无 | 检查 venv/模型/GPU/依赖版本是否就绪 |
+
+`layout=false`（默认）返回清洗后的纯文本；`layout=true` 保留 `<|det|>` 版面坐标，供需要版面信息的下游使用。
+
+### 实现要点（踩坑记录）
+
+- **纯 Node 标准库**（`uocr_mcp.js`，零 npm 依赖），启动 **83ms** —— WorkBuddy 自定义连接器握手窗口很窄，Python 入口（含 PyInstaller onedir ~1.7s）会超时被杀。
+- **裸 JSON 兼容**：WorkBuddy 发的是 newline-delimited 裸 JSON（**无 `Content-Length:` 帧头**），标准 MCP 帧 parser 会死等分隔符而卡死。`uocr_mcp.js` 双兼容：首个 chunk 探测格式，按客户端格式回。
+- **spawn 环境**：调 CLI 时强制 `PYTHONPATH=''` + `ACC_PRODUCT_CONFIG_V3=''` + `PYTHONIOENCODING=utf-8`，否则 WorkBuddy 注入的 sitecustomize shim 会劫持 `shutil.rmtree` 干扰 transformers/tempfile。
+- **超时预算**：按 `max_pages × 60s` 动态给（最少 5min、最多 30min），避免长文档被中途 kill。
+- **stdout 洁净**：CLI 用 `import pymupdf as fitz`（旧写法 `import fitz` 的 deprecation warning 会污染 stdout）。
+
+### 实测（端到端经 MCP 调用）
+
+| 项 | 结果 |
+|---|---|
+| initialize 握手 | 83ms |
+| tools/list | 3 个工具正常返回 |
+| check_status | torch 2.10.0+cu128 / transformers 4.57.1 / cuda True / RTX 5070 |
+| `ocr_pdf`（50MB 扫描本，2 页） | **28.8s，1982 字纯中文正文** |
+
+### 本地自测命令
+
+```bash
+# 握手 + 环境检查
+node E:\Workbuddy\Unlimited-OCR\test_uocr_mcp.js
+# 端到端 OCR（参数：PDF路径 页数）
+node E:\Workbuddy\Unlimited-OCR\test_uocr_mcp_ocr.js "E:/path/to/scan.pdf" 2
+```
+
+诊断日志：`E:\Workbuddy\Unlimited-OCR\uocr_mcp_boot.log`（记录首 chunk 是否带帧头、每次 tools/call）。

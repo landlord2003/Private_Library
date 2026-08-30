@@ -3,28 +3,55 @@
 # - 多线程(max_workers) 避免单本 fitz 卡死阻塞全量
 # - 每本硬超时(60s)，超时被丢弃并标记 skip，不影响其他书
 # - 进度落盘(_extract_run.log)，可续跑：重抽 text_content<=10 或 NULL 且 text_extracted<>1 的书
-import sys, os, time, sqlite3, traceback, concurrent.futures as cf
+import sys, os, time, sqlite3, traceback, threading, concurrent.futures as cf
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import Private_Lib as P
 
-DB = r"F:/my-library/data/library.db"
+DB = r"G:/my-library/data/library.db"
 WORKERS = 4
 PER_BOOK_TIMEOUT = 60
 # ocr 模式用独立日志，避免与全量抽取日志混写导致进度误读
 _MODE = sys.argv[1] if len(sys.argv) > 1 else ""
-LOG = r"F:/my-library/tools/_ocr_run.log" if _MODE == "ocr" else r"F:/my-library/tools/_extract_run.log"
+LOG = r"G:/my-library/tools/_ocr_run.log" if _MODE == "ocr" else r"G:/my-library/tools/_extract_run.log"
 
 logf = open(LOG, "a", encoding="utf-8")
 def L(*a):
     s = " ".join(str(x) for x in a)
     print(s, flush=True); logf.write(s + "\n"); logf.flush()
 
+# 心跳线程: 每10s向stdout输出一行, 防止长耗时OCR期间stdout沉默被后台任务管理器误判卡死回收。
+# (实测: 单本GPU OCR可达数十秒~数分钟, 仅每本print不足以维持活跃判定)
+_HB = {"done": 0, "total": 0, "extracted": 0, "stop": False}
+def _heartbeat():
+    while not _HB["stop"]:
+        time.sleep(10)
+        if _HB["stop"]:
+            break
+        L(f"[hb] alive done={_HB['done']}/{_HB['total']} extracted={_HB['extracted']}")
+if os.environ.get("OCR_NO_HB") != "1":
+    threading.Thread(target=_heartbeat, daemon=True).start()
+
 def work(bid, fpath, ff):
     try:
         ok = P.extract_text_for(bid, fpath, ff)
+        # 书名兜底(text_extracted=0)的书：tesseract 抽不出(多为超大扫描版, MuPDF 渲染超限)，
+        # 标记 ocr_tess=skip 移出候选，留给 Unlimited-OCR 阶段2，避免每轮重启死循环重抽。
+        if ok:
+            try:
+                _lc = sqlite3.connect(DB, timeout=30)
+                _te = _lc.execute("SELECT text_extracted FROM books WHERE id=?", (bid,)).fetchone()
+                _lc.close()
+                if _te and _te[0] == 0:
+                    _pp = sqlite3.connect(r"G:/my-library/tools/progress.db", timeout=30)
+                    _pp.execute("INSERT OR REPLACE INTO tool_progress(tool,book_id,status) VALUES('ocr_tess',?, 'skip')", (bid,))
+                    _pp.commit(); _pp.close()
+            except Exception:
+                pass
+        L(f"  {bid[:8]} {'+extract' if ok else '~skip'}")
         return (bid, True if ok else False, None)
     except Exception as e:
+        L(f"  {bid[:8]} ERR {type(e).__name__}: {e}")
         return (bid, False, f"{type(e).__name__}: {e}")
 
 def main():
@@ -48,6 +75,16 @@ def main():
                WHERE b.status='active' AND b.text_extracted<>1"""
     rows = con.execute(q).fetchall()
     con.close()
+    # 排除已标记 tesseract 抽不出的书(留给 Unlimited-OCR 阶段2)，避免死循环重抽
+    try:
+        _pp = sqlite3.connect(r"G:/my-library/tools/progress.db", timeout=30)
+        _skip = set(r[0] for r in _pp.execute("SELECT book_id FROM tool_progress WHERE tool='ocr_tess' AND status='skip'").fetchall())
+        _pp.close()
+        if _skip:
+            rows = [r for r in rows if r[0] not in _skip]
+            L(f"[filter] excluded {len(_skip)} tesseract-unavailable books (leave to Unlimited-OCR)")
+    except Exception:
+        pass
     # 大文件预标记：>1500MB 的文件在 extract_text_for 内走跳过逻辑(不抽正文，仅回落书名)，
     # 但不会置 text_extracted=1，导致续跑/OCR 模式反复把它们重选进来死循环。
     # 这里一次性标记为大文件已处理(置 text_extracted=1, 空正文)，移出候选集，
@@ -74,26 +111,31 @@ def main():
     workers = int(os.environ.get("OCR_WORKERS", "1")) if mode == "ocr" else WORKERS
     timeout = int(os.environ.get("OCR_WORKERS_TIMEOUT", "180")) if mode == "ocr" else PER_BOOK_TIMEOUT
     L(f"[start] candidates={len(rows)} mode={mode} workers={workers} timeout={timeout}s")
+    _HB["total"] = len(rows)
     done = extracted = skipped = 0
     t0 = time.time()
-    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(work, r[0], r[1], r[2]): r for r in rows}
-        for fut in cf.as_completed(futs):
-            try:
-                bid, ok, err = fut.result(timeout=timeout)
-            except cf.TimeoutError:
-                bid = futs[fut][0]
-                skipped += 1; done += 1
-                L(f"  timeout {bid[:8]} (fitz hang, skipped)"); continue
-            done += 1
-            if ok:
-                extracted += 1
-            else:
-                skipped += 1
-                if err: L(f"  skip {bid[:8]}: {err}")
-            if done % 50 == 0:
-                dt = time.time() - t0
-                L(f"[prog] done={done}/{len(rows)} extracted={extracted} skipped={skipped} elapsed={dt:.0f}s rate={done/dt:.1f}/s")
+    try:
+        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(work, r[0], r[1], r[2]): r for r in rows}
+            for fut in cf.as_completed(futs):
+                try:
+                    bid, ok, err = fut.result(timeout=timeout)
+                except cf.TimeoutError:
+                    bid = futs[fut][0]
+                    skipped += 1; done += 1; _HB["done"] = done
+                    L(f"  timeout {bid[:8]} (fitz hang, skipped)"); continue
+                done += 1
+                if ok:
+                    extracted += 1
+                else:
+                    skipped += 1
+                    if err: L(f"  skip {bid[:8]}: {err}")
+                _HB["done"] = done; _HB["extracted"] = extracted
+                if done % 50 == 0:
+                    dt = time.time() - t0
+                    L(f"[prog] done={done}/{len(rows)} extracted={extracted} skipped={skipped} elapsed={dt:.0f}s rate={done/dt:.1f}/s")
+    finally:
+        _HB["stop"] = True
     L(f"[done] total={len(rows)} extracted={extracted} skipped={skipped} elapsed={time.time()-t0:.0f}s")
 
 if __name__ == "__main__":

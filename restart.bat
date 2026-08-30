@@ -5,12 +5,19 @@ cd /d "%~dp0"
 
 REM Locate python via %USERPROFILE% to avoid hardcoding the Chinese username
 set "PY=python"
-if exist "%USERPROFILE%\.workbuddy\binaries\python\versions\3.13.12\python.exe" set "PY=%USERPROFILE%\.workbuddy\binaries\python\versions\3.13.12\python.exe"
-if not exist "%USERPROFILE%\.workbuddy\binaries\python\versions\3.13.12\python.exe" if exist "C:\Users\Lenovo\.workbuddy\binaries\python\versions\3.13.12\python.exe" set "PY=C:\Users\Lenovo\.workbuddy\binaries\python\versions\3.13.12\python.exe"
+REM 优先 3.13.12.old.20808：该解释器装有 fitz/bs4/mobi，导入书籍时的自动封面与
+REM 正文提取依赖它们；若用 3.13.12（缺这些库）启动，提取会静默失效、只能手动补。
+if exist "%USERPROFILE%\.workbuddy\binaries\python\versions\3.13.12.old.20808\python.exe" set "PY=%USERPROFILE%\.workbuddy\binaries\python\versions\3.13.12.old.20808\python.exe"
+if not exist "%USERPROFILE%\.workbuddy\binaries\python\versions\3.13.12.old.20808\python.exe" if exist "C:\Users\Lenovo\.workbuddy\binaries\python\versions\3.13.12.old.20808\python.exe" set "PY=C:\Users\Lenovo\.workbuddy\binaries\python\versions\3.13.12.old.20808\python.exe"
+if "%PY%"=="python" if exist "%USERPROFILE%\.workbuddy\binaries\python\versions\3.13.12\python.exe" set "PY=%USERPROFILE%\.workbuddy\binaries\python\versions\3.13.12\python.exe"
 
 REM Metadata online fill switch: 1=built-in crawler ON (P0 feature); 0=off.
 REM Set to 0 if you do NOT want background network metadata fill on startup.
 set "LIB_METADATA_ONLINE=1"
+
+REM LAN access: 0.0.0.0 = phone/other devices on same WiFi can reach http://<this-PC-IP>:8000.
+REM 127.0.0.1 = local-only (private). Set 0.0.0.0 to browse the library from your phone.
+set "LIB_HOST=0.0.0.0"
 
 echo Using Python: %PY%
 echo Stopping old service on port 8000 (if any)...

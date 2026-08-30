@@ -30,6 +30,13 @@ tools/*_log.txt
 _*.html
 tools/_*.py
 scripts/_*.py
+tools/_jscheck/
+*.flag
+
+# === 运行时产物（OCR/编排器临时目录与标志）===
+tools/ocr_tmp/
+tools/_ocr_run.log
+tools/_extract_run.log
 
 # === 修复脚本（一次性本地工具）===
 fix_permissions.bat

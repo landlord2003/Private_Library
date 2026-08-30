@@ -44,14 +44,22 @@ def get_counts():
         queries = {
             "tb": "SELECT count(*)as c FROM books WHERE status='active'",
             "tm": "SELECT count(*)as c FROM media WHERE status='active'",
-            "ts": "SELECT count(*)as c FROM books WHERE status='active' AND summary IS NOT NULL",
+            # 口径修正(2026-08-30)：必须排除空字符串 ''。库里 490 本未摘要中仅 4 本是 NULL、
+            # 486 本是 ''，只判 IS NOT NULL 会把这 486 本误算成"已摘要"(虚高至 15057)。
+            "ts": "SELECT count(*)as c FROM books WHERE status='active' AND summary IS NOT NULL AND summary<>''",
             "import_rem": "SELECT count(*)as c FROM books WHERE status='active' AND id NOT IN(SELECT book_id FROM book_categories)",
-            "sum_rem": "SELECT count(*)as c FROM books WHERE status='active' AND summary IS NULL AND id IN (SELECT id FROM book_text WHERE text_content IS NOT NULL)",
-            "no_text": "SELECT count(*)as c FROM books WHERE status='active' AND id NOT IN (SELECT id FROM book_text WHERE text_content IS NOT NULL)",
+            # "可立即摘要" = 已有正文(text_extracted=1)且无摘要。口径不能只判 book_text 有内容：
+            # 书名兜底也会往 book_text 写入标题行，会把 322 本实际无正文的书误算成"可摘要"
+            # (实测：未摘要 490 本中，真正有正文可摘的仅 168 本)。
+            "sum_rem": "SELECT count(*)as c FROM books WHERE status='active' AND (summary IS NULL OR summary='') AND text_extracted=1",
+            # 口径修正(2026-08-30)：原按"book_text 表里无内容"统计，但书名兜底也会往 book_text
+            # 写入标题行 → 该数恒为 0，与"未提取正文"的真实情况严重不符(实际 4575 本)。
+            # 改用 text_extracted 标志：抽取成功置 1、书名兜底置 0，才是真正的"未提取正文"。
+            "no_text": "SELECT count(*)as c FROM books WHERE status='active' AND (text_extracted IS NULL OR text_extracted<>1)",
             "fmt_dist": "SELECT file_format as k,count(*)as c FROM books WHERE status='active' GROUP BY file_format ORDER BY c DESC",
             "cat_dist": "SELECT cat.id as cid,cat.name as k,count(*)as c FROM categories cat JOIN book_categories bc ON cat.id=bc.category_id JOIN books b ON b.id=bc.book_id WHERE b.status='active' GROUP BY cat.id,cat.name ORDER BY c DESC LIMIT 20",
-            "mtr": "SELECT count(*)as c FROM media WHERE status='active' AND transcript IS NOT NULL",
-            "msu": "SELECT count(*)as c FROM media WHERE status='active' AND summary IS NOT NULL",
+            "mtr": "SELECT count(*)as c FROM media WHERE status='active' AND transcript IS NOT NULL AND transcript<>''",
+            "msu": "SELECT count(*)as c FROM media WHERE status='active' AND summary IS NOT NULL AND summary<>''",
             "meta_done": "SELECT count(*)as c FROM books WHERE status='active' AND ((publisher IS NOT NULL AND publisher<>'') OR (isbn IS NOT NULL AND isbn<>''))",
         }
         for k, sql in queries.items():
@@ -305,17 +313,84 @@ def _tool_center_html():
     h += '<a class=sb href="/?p=stats"><div class=n style="color:#52c41a">%d</div><div class=l>📄 已抽全文</div></a>' % cov.get('text_extracted',0)
     h += '<a class=sb href="/?p=stats"><div class=n style="color:#fa8c16">%d</div><div class=l>🧬 图谱L1已生成</div></a>' % tools.get('kg',{}).get('done',0)
     h += '<a class=sb href="/?p=stats"><div class=n style="color:#c0392b">%d</div><div class=l>⚠️ 待修假摘要</div></a>' % fake
-    h += '<a class=sb href="/graph"><div class=n style="color:#722ed1">%d</div><div class=l>🕸 知识图谱浏览器</div></a>' % tb
+    h += '<a class=sb href="/graph"><div class=n style="color:#722ed1">%d</div><div class=l>🕸 知识图谱浏览器</div></a>' % total
     h += '</div></div>'
-    # 离线批处理
-    h += '<div style="display:flex;flex-wrap:wrap;margin-top:6px">'
-    h += '<div style="width:100%;font-weight:700;margin:10px 6px 0;color:#722ed1">⚙️ 离线批处理工具（tools/，可续跑）</div>'
+    # ===== 公共变量（流水线与辅助区共用）=====
+    gc = get_counts()
+    _tb = gc['tb']; _tm = gc['tm']
+    _cls = _tb - gc['import_rem']
+    _rs = cov['summary'] - st.get('fake_summary',0)
+    _md = gc.get('meta_done',0)
+    _mtr = gc.get('mtr',0); _msu = gc.get('msu',0)
+    ext_n = cov.get('text_extracted',0)
+    def pctm(n): return min(100, round((n or 0)*100.0/max(_tm,1),1))
+    _run = lambda k: (' <span style="color:#52c41a">🟢运行中</span>' if tools.get(k,{}).get('running') else '')
+    def _sel(oid, opts, defv):
+        s = '<select id=%s>' % oid
+        for v, l in opts:
+            s += '<option value="%s"%s>%s</option>' % (v, ' selected' if str(v)==str(defv) else '', l)
+        return s + '</select>'
+    _CO = [(5,'5'),(10,'10'),(20,'20'),(50,'50'),(100,'100'),(500,'500'),(1000,'1000')]
+
+    # ===== 书籍处理流水线 =====
+    h += '<div style="width:100%;font-weight:700;margin:16px 6px 2px;color:#0F6E56;font-size:15px">📚 书籍处理流水线</div>'
+    h += '<p class=co style="margin:0 6px 8px">按 <b>① 分类 → ② 提取正文 → ③ 摘要</b> 顺序跑。分类只需书名可最先跑；有了正文才能生成高质量摘要。</p>'
+    # 待处理统计（原首页「AI 处理」面板显示，移至工具中心后补齐）
+    _n_nosum = max(0, _tb - (cov.get('summary',0) or 0))
+    h += ('<div class=panel style="margin:0 6px 10px;padding:10px 14px;font-size:13px">📊 <b>待处理</b>：'
+          '未分类 <b style="color:#1677ff">%d</b> 本　·　未提取正文 <b style="color:#52c41a">%d</b> 本　·　未摘要 <b style="color:#722ed1">%d</b> 本'
+          '　<span style="color:#999">（其中已有正文、可立即摘要 <b style="color:#722ed1">%d</b> 本；其余 %d 本需先跑 ② 提取正文。'
+          '已分类 %d / 已抽正文 %d / 已有摘要 %d，共 %d 本）</span></div>'
+          ) % (gc.get('import_rem',0), gc.get('no_text',0), _n_nosum, gc.get('sum_rem',0),
+               max(0, _n_nosum - (gc.get('sum_rem',0) or 0)), _cls, ext_n, cov.get('summary',0), _tb)
+    h += '<div style="display:flex;flex-wrap:wrap">'
+    h += card('🏷️','① AI 分类',
+        '调用本机 Ollama 给书打一级/二级分类 + 标签 + 难度。只需书名，不依赖正文。',
+        '已分类 %d / %d 本 (%.1f%%)' % (_cls, _tb, pct(_cls)), _cls, '#1677ff', '', '',
+        '数量 '+_sel('clsCnt',_CO,10)+' <button class=btn id=clsBtn onclick="CLS()">▶ 开始分类</button> <span id=clsRes></span>'+_run('classify'))
+    h += card('📄','② 提取正文',
+        '抽取 PDF/EPUB/MOBI 正文存入 book_text，供摘要与检索使用。扫描版 PDF 走 OCR（tesseract 中文包）。',
+        '%d / %d 本 (%.1f%%)' % (ext_n, total, pct(ext_n)), ext_n, '#52c41a', '/?p=stats', '查看全文覆盖率',
+        '数量 '+_sel('extCnt',_CO,10)+' <button class=btn id=extBtn onclick="EXT()">▶ 开始提取</button> <span id=extRes></span>'+_run('extract'))
+    h += card('🤖','③ AI 摘要',
+        '基于已提取正文生成结构化摘要（一句话/观点/概念/读者/难度）。正文缺失的书无法生成。',
+        '已摘要 %d / %d 本 (%.1f%%)' % (_rs, _tb, pct(_rs)), _rs, '#722ed1', '/?p=detail&list=1', '查看已摘要',
+        '数量 '+_sel('sumCnt',[(1,'1'),(3,'3'),(5,'5'),(10,'10'),(20,'20'),(100,'100'),(500,'500'),(1000,'1000')],3)
+        +' <button class=btn id=sumBtn onclick="SUM()">▶ 开始摘要</button> <span id=sumRes></span>'+_run('summarize'))
+    h += '</div>'
+
+    # ===== 媒体处理流水线 =====
+    h += '<div style="width:100%;font-weight:700;margin:16px 6px 2px;color:#854F0B;font-size:15px">🎧 媒体处理流水线</div>'
+    h += '<p class=co style="margin:0 6px 8px">按 <b>① 转录 → ② 摘要</b> 顺序：先用 Whisper 把音视频转成文字，再基于转录文本生成摘要。</p>'
+    # 待处理统计（原首页「媒体转录与摘要」面板显示，移至工具中心后补齐）
+    h += ('<div class=panel style="margin:0 6px 10px;padding:10px 14px;font-size:13px">📊 <b>待处理</b>：'
+          '待转录 <b style="color:#13c2c2">%d</b> 个　·　已转录待摘要 <b style="color:#eb2f96">%d</b> 个'
+          '　<span style="color:#999">（已转录 %d / 已摘要 %d，共 %d 个）</span></div>'
+          ) % (max(0, _tm-_mtr), max(0, _mtr-_msu), _mtr, _msu, _tm)
+    h += '<div style="display:flex;flex-wrap:wrap">'
+    h += card('🎙️','① 媒体转录',
+        'Whisper 把音视频转成文字，存入 media.transcript。耗时较长，适合后台慢慢跑。',
+        '已转录 %d / %d 条 (%.1f%%)' % (_mtr, _tm, pctm(_mtr)), _mtr, '#13c2c2', '/?p=media_transcribed', '查看转录结果',
+        '数量 '+_sel('trsCnt',[(5,'5'),(10,'10'),(50,'50'),(100,'100'),(500,'500')],10)
+        +' '+_sel('trsType',[('all','全部'),('audio','仅音频'),('video','仅视频')],'all')
+        +' <button class=btn id=trsBtn onclick="TRS()">▶ 开始转录</button> <span id=trsRes></span>'+_run('transcribe'))
+    h += card('📝','② 媒体摘要',
+        '基于转录文本生成媒体 AI 摘要。需先完成转录。',
+        '已摘要 %d / %d 条 (%.1f%%)' % (_msu, _tm, pctm(_msu)), _msu, '#eb2f96', '/?p=media_summarized', '查看媒体摘要',
+        '数量 '+_sel('msuCnt',[(50,'50'),(100,'100'),(500,'500'),(1000,'1000')],100)
+        +' <button class=btn id=msuBtn onclick="MSU()">▶ 开始摘要</button> <span id=msuRes></span>'+_run('media_summarize'))
+    h += '</div>'
+
+    # ===== 辅助与离线批处理 =====
+    h += '<div style="width:100%;font-weight:700;margin:16px 6px 2px;color:#722ed1;font-size:15px">⚙️ 辅助与离线批处理（tools/，可续跑）</div>'
+    h += '<p class=co style="margin:0 6px 8px">大头跑批与修复类工具，进度写入 progress.db，进程崩溃可续跑、停了不白跑。</p>'
+    h += '<div style="display:flex;flex-wrap:wrap">'
     ext_n = cov.get('text_extracted',0)
     h += card('📄','提取文本',
         '抽取 PDF/EPUB/MOBI/TXT 正文存入 book_text，供 AI 摘要、知识图谱、全文检索。PDF 仅取前 5–30 页、上限 20 万字；&gt;1500MB 超大文件回落书名；其余扫描版先 Unlimited-OCR、tesseract 兜底。',
         '%d / %d 本 (%.1f%%)' % (ext_n, total, pct(ext_n)), ext_n, '#52c41a',
         '/?p=stats', '查看全文提取覆盖率',
-        '<button class=btn onclick="EXTR()">▶ 全量抽取(续跑)</button> <span id=extRes></span>')
+        '<button class=btn onclick="EXTR()">▶ 全量抽取(续跑)</button> <span id=offExtRes></span>')
     ocr_n = cov.get('ocr_pending',0)
     h += card('📷','扫描版OCR',
         '对「已抽但正文极短(疑似书名兜底)」的扫描版PDF，优先用本机 Unlimited-OCR(DeepSeek-OCR 谱系, 见 E:/Workbuddy/Unlimited-OCR)抽取无文字层书籍正文, 缺失时回落 tesseract+chi_sim(需 tools/install_tesseract.bat)。',
@@ -340,36 +415,34 @@ def _tool_center_html():
         '用 Open Library(主源,直连免代理) + Google Books 回填出版社/ISBN/年份/简介。根治 Douban 403。',
         '出版社 %.1f%% · ISBN %.1f%% · 已完成 %d 本' % (pct(pub_n), pct(isbn_n), mt.get('done',0)),
         pub_n, '#13c2c2', '/?p=stats', '查看元数据覆盖率',
-        '模式<select id=metaMode><option value=fast>fast</option><option value=full>full</option></select> <input id=metaLimit value=200 style="width:70px"> <button class=btn onclick="TR(\'meta\',false)">▶ 跑一批</button> <button class=btn onclick="TR(\'meta\',true)">🔁 重试失败</button> <span id=metaRes></span>')
+        '模式<select id=metaMode><option value=fast>fast</option><option value=full>full</option></select> <input id=metaLimit value=200 style="width:70px"> <button class=btn onclick="TR(\'meta\',false)">▶ 跑一批</button> <button class=btn onclick="TR(\'meta\',true)">🔁 重试失败</button> <span id=offMetaRes></span>')
     sm = tools.get('summary',{})
     h += card('✏️','摘要修复',
         '智能摘要跑批：先修 %d 条「假摘要」(有正文重跑真摘要/无正文清空)，再补真正缺失的摘要；无正文的书标「无正文不可摘」跳过。需 Ollama 在线。' % fake,
         '待修 %d 本 · 已完成 %d 本 · %s' % (fake, sm.get('done',0), '🟢运行中' if sm.get('running') else '⚪空闲'),
         max(0, fake), '#c0392b', '/?p=stats', '查看摘要健康',
-        '<span id=sumPending style="color:#c0392b;font-size:12px"></span><br><input id=sumLimit value=20000 style="width:80px"> <button class=btn onclick="TR(\'summary\',false)">▶ 跑一批</button> <button class=btn onclick="TR(\'summary\',false,20000)">🔥 全量修复</button> <span id=sumRes></span>')
+        '<span id=sumPending style="color:#c0392b;font-size:12px"></span><br><input id=sumLimit value=20000 style="width:80px"> <button class=btn onclick="TR(\'summary\',false)">▶ 跑一批</button> <button class=btn onclick="TR(\'summary\',false,20000)">🔥 全量修复</button> <span id=offSumRes></span>')
     h += '</div>'
-    # 在服实时
-    h += '<div style="display:flex;flex-wrap:wrap;margin-top:6px">'
-    h += '<div style="width:100%;font-weight:700;margin:10px 6px 0;color:#1677ff">⚡ 在服实时工具（首页「AI 处理」面板触发）</div>'
-    gc = get_counts()
-    _tb = gc['tb']; _tm = gc['tm']
-    _cls = _tb - gc['import_rem']
-    _rs = cov['summary'] - st.get('fake_summary',0)
-    _md = gc.get('meta_done',0)
-    _mtr = gc.get('mtr',0); _msu = gc.get('msu',0)
-    def pctm(n): return min(100, round((n or 0)*100.0/max(_tm,1),1))
-    _run = lambda k: (' <span style="color:#52c41a">🟢运行中</span>' if tools.get(k,{}).get('running') else '')
-    h += card('🏷️','AI 分类','导入或手动触发，调用本机 Ollama 给书打一级/二级分类+标签+难度。','已分类 %d / %d 本 (%.1f%%)' % (_cls, _tb, pct(_cls)), _cls, '#1677ff', '', '', '<a class=btn href="/">前往首页 AI 面板</a>'+_run('classify'))
-    h += card('🤖','AI 摘要','基于正文生成结构化 AI 摘要(一句话/观点/概念/读者/难度)。','已摘要 %d / %d 本 (%.1f%%)' % (_rs, _tb, pct(_rs)), _rs, '#1677ff', '', '', '<a class=btn href="/">前往首页 AI 面板</a>'+_run('summarize'))
-    h += card('🔎','在线元数据','导入时实时调 Open Library 补全出版社/ISBN。','已补全 %d / %d 本 (%.1f%%)' % (_md, _tb, pct(_md)), _md, '#1677ff', '', '', '<a class=btn href="/">前往首页 AI 面板</a>'+_run('metadata'))
-    h += card('🎧','媒体转录','Whisper 转录音视频为文字，存 media.transcript。','已转录 %d / %d 条 (%.1f%%)' % (_mtr, _tm, pctm(_mtr)), _mtr, '#1677ff', '', '', '<a class=btn href="/?p=media">前往媒体库</a>'+_run('transcribe'))
-    h += card('📝','媒体摘要','基于转录文本生成媒体 AI 摘要。','已摘要 %d / %d 条 (%.1f%%)' % (_msu, _tm, pctm(_msu)), _msu, '#1677ff', '', '', '<a class=btn href="/?p=media">前往媒体库</a>'+_run('media_summarize'))
+    h += '<div style="display:flex;flex-wrap:wrap">'
+    h += card('🔎','在线元数据',
+        '导入时或手动触发，实时调 Open Library 补全出版社/ISBN（需 LIB_METADATA_ONLINE=1）。',
+        '已补全 %d / %d 本 (%.1f%%)' % (_md, _tb, pct(_md)), _md, '#1677ff', '', '',
+        '数量 '+_sel('metaCnt',[(0,'全部'),(10,'10'),(50,'50'),(100,'100'),(500,'500'),(1000,'1000')],0)
+        +' <button class=btn id=metaBtn onclick="META()">▶ 补全元数据</button> <span id=metaRes></span>'+_run('metadata'))
+    h += card('🔁','重试失败转录',
+        '对之前转录失败的媒体重试（确认 ffmpeg 与显卡就绪后跑）。',
+        '待转录 %d 条' % max(0, _tm-_mtr), max(0, _tm-_mtr), '#fa8c16', '/?p=media', '去媒体库',
+        '<button class=btn id=trsRBtn onclick="TRSR()" style="background:#fa8c16;color:#fff">🔁 重试失败转录</button> <span id=trsRRes></span>')
+    h += card('📊','重摘超长媒体',
+        '对转录文本超长（&gt;8000 字）的媒体重新生成摘要。',
+        '已摘要 %d 条' % _msu, _msu, '#722ed1', '/?p=media_summarized', '查看媒体摘要',
+        '<button class=btn id=mslBtn onclick="MSUL()" style="background:#722ed1;color:#fff">🔁 重摘超长媒体</button> <span id=mslRes></span>')
     h += '</div>'
     # JS：复用 TR/TP/SP/TNREC + 新增 EXTR
     h += '<div style="margin-top:10px"><button class=btn onclick="TP()">🔄 刷新进度</button> <span id=toolStat style="font-size:12px;color:#666"></span></div>'
     js = '''<script>
 function EXTR(){var x=new XMLHttpRequest();x.open("POST","/api/extract-batch");x.setRequestHeader("Content-Type","application/json");
-x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById("extRes").textContent=r.status||(r.ok?"已启动":"失败");TP();}catch(e){document.getElementById("extRes").textContent="error"}};
+x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById("offExtRes").textContent=r.status||(r.ok?"已启动":"失败");TP();}catch(e){document.getElementById("offExtRes").textContent="error"}};
 x.send(JSON.stringify({count:20000}));}
 function EXTR_OCR(){var x=new XMLHttpRequest();x.open("POST","/api/extract-ocr");x.setRequestHeader("Content-Type","application/json");
 x.onload=function(){try{var r=JSON.parse(x.responseText);if(r.status=="no_tesseract"){document.getElementById("ocrRes").textContent="⚠️ 未装tesseract，先跑 install_tesseract.bat";return;}if(r.status=="no_chi_sim"){document.getElementById("ocrRes").textContent="⚠️ 缺中文包chi_sim，OCR无法识别中文，请把chi_sim.traineddata放入tessdata";return;}document.getElementById("ocrRes").textContent=r.status||"已启动";OCRPOLL();}catch(e){document.getElementById("ocrRes").textContent="error"}};
@@ -381,12 +454,16 @@ function TR(t,re,lf){var lim=lf||(t=='kg'?document.getElementById('kgLimit').val
 var md=(t=='meta'?document.getElementById('metaMode').value:'');
 var b=JSON.stringify({tool:t,limit:lim,mode:md,regen:!!re});
 var x=new XMLHttpRequest();x.open('POST','/api/tools/run');x.setRequestHeader('Content-Type','application/json');
-x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById(t+'Res').textContent=r.msg||(r.ok?'已启动':'失败');TP();}catch(e){document.getElementById(t+'Res').textContent='error'}};x.send(b);}
+var rid=(t=='meta'?'offMetaRes':(t=='summary'?'offSumRes':t+'Res'));
+x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById(rid).textContent=r.msg||(r.ok?'已启动':'失败');TP();}catch(e){document.getElementById(rid).textContent='error'}};x.send(b);}
 function TP(){var x=new XMLHttpRequest();x.open('GET','/api/tools/status');x.onload=function(){try{var r=JSON.parse(x.responseText);var s='';for(var k in r){if(k=='_error'){s+='读取错误:'+r[k];continue;}var v=r[k];s+=k+': 完成'+v.done+' 跳过'+v.skip+(v.running?' [运行中]':'')+'  ';}document.getElementById('toolStat').textContent=s;}catch(e){}};x.send();}
 function SP(){var x=new XMLHttpRequest();x.open('GET','/api/summary-fix/pending');x.onload=function(){try{var r=JSON.parse(x.responseText);document.getElementById('sumPending').textContent='待修假摘要 '+r.pending+' 本（有全文可重跑 '+r.has_text+' · 无全文将清空 '+r.no_text+'）';}catch(e){}};x.send();}
 TP();SP();
 </script>'''
     h += js
+    # 引入首页共用 JS：CLS/SUM/EXT/META/TRS/MSU/TRSR/MSUL 等实时工具执行函数。
+    # 工具中心的流水线卡片复用同一套函数与元素 id 约定，故按钮无需跳转首页即可直接执行。
+    h += COMMON_JS
     return h
 
 
@@ -486,19 +563,19 @@ CSS = """* { margin:0; padding:0; box-sizing:border-box; } body { font-family: "
 NAV = '<nav><h2>📚 我的图书馆</h2><a href="/">🏠 首页</a><a href="/?p=books">📖 书库 ({B})</a><a href="/?p=media">🎧 媒体库 ({M})</a><a href="/?p=import">📥 导入新书</a><a href="/?p=notes">📝 笔记 ({N})</a><a href="/?p=tools">🛠️ 工具中心</a><a href="/?p=stats">📊 统计</a><a href="/?p=title-norm">📐 书名规则化</a><div class="cat-tree">{TREE}</div><div class="shelf-box">{SHELVES}</div><div class="theme-row"><button class="theme-btn" onclick="toggleTheme()" title="切换深浅色">🌙 深色</button></div></nav>'
 
 EXTRA_CSS = """
-.cat-tree{padding:8px 0 14px;border-top:1px solid #f0f0f0;margin-top:6px;max-height:calc(100vh - 220px);overflow-y:auto}
-.cat-tree .ci{margin:1px 0}
-.cat-tree .cl{display:flex;align-items:center;padding:7px 20px;color:#333;font-size:14px;cursor:pointer}
+.cat-tree{padding:5px 0 8px;border-top:1px solid #f0f0f0;margin-top:4px;max-height:calc(100vh - 300px);overflow-y:auto}
+.cat-tree .ci{margin:0}
+.cat-tree .cl{display:flex;align-items:center;padding:4px 20px;color:#333;font-size:14px;cursor:pointer;line-height:1.35}
 .cat-tree .cl:hover,.cat-tree .cl.act{background:#e6f4ff;color:#1677ff}
 .cat-tree .cl .ct{margin-left:auto;padding-left:8px;color:#bbb;font-size:12px}
-.cat-tree .cl .caret{display:inline-flex;align-items:center;justify-content:center;width:16px;height:18px;color:#999;cursor:pointer;user-select:none;font-size:12px;flex-shrink:0}
+.cat-tree .cl .caret{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;color:#999;cursor:pointer;user-select:none;font-size:12px;flex-shrink:0}
 .cat-tree .cl .caret:hover{color:#1677ff}
 .cat-tree .clink{color:inherit;text-decoration:none}
 .cat-tree .clink:hover{color:#1677ff}
-.shelf-box{padding:6px 0 14px;border-top:1px solid #f0f0f0;margin-top:6px}
-.shelf-box .sb-h{padding:6px 20px;color:#999;font-size:12px;font-weight:bold;display:flex;align-items:center;justify-content:space-between}
+.shelf-box{padding:4px 0 10px;border-top:1px solid #f0f0f0;margin-top:4px}
+.shelf-box .sb-h{padding:4px 20px;color:#999;font-size:12px;font-weight:bold;display:flex;align-items:center;justify-content:space-between}
 .shelf-box .sb-h a{color:#1677ff;text-decoration:none;font-weight:normal}
-.shelf-box .shelf{display:flex;align-items:center;padding:6px 20px;color:#333;text-decoration:none;font-size:14px}
+.shelf-box .shelf{display:flex;align-items:center;padding:4px 20px;color:#333;text-decoration:none;font-size:14px;line-height:1.35}
 .shelf-box .shelf:hover{background:#f0f5ff;color:#1677ff}
 .shelf-box .shelf .sn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
 .shelf-box .shelf .sd{color:#bbb;cursor:pointer;margin-left:8px;font-size:12px}
@@ -511,9 +588,9 @@ EXTRA_CSS = """
 .sb-btn{background:#fff!important;color:#1677ff;border:1px solid #1677ff!important}
 .rs-btn{background:#1677ff;color:#fff;border:1px solid #1677ff;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:13px;margin-left:6px}
 .rs-btn.off{background:#fff;color:#888;border-color:#ccc}
-.cat-tree .sl{display:none;padding:2px 0 4px 12px}
+.cat-tree .sl{display:none;padding:1px 0 2px 12px}
 .cat-tree .sl.open{display:block}
-.cat-tree .sl a{display:block;padding:5px 20px 5px 30px;color:#666;text-decoration:none;font-size:13px}
+.cat-tree .sl a{display:block;padding:3px 20px 3px 30px;color:#666;text-decoration:none;font-size:13px;line-height:1.35}
 .cat-tree .sl a:hover,.cat-tree .sl a.act{background:#f0f5ff;color:#1677ff}
 .grid{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px}
 .card{width:116px;text-decoration:none;color:inherit;display:block}
@@ -521,11 +598,13 @@ EXTRA_CSS = """
 .card .cv{display:flex;align-items:center;justify-content:center;color:#fff;font-size:28px}
 .card .t{font-size:12px;margin-top:6px;line-height:1.35;height:32px;overflow:hidden}
 .topbar{display:none}
+.tb-link{display:none}
 .overlay{display:none}
 @media(max-width:768px){
   body{display:block}
   .topbar{display:flex;position:fixed;top:0;left:0;right:0;height:50px;align-items:center;gap:12px;padding:0 14px;background:#1677ff;color:#fff;z-index:1100;box-shadow:0 2px 6px rgba(0,0,0,.18)}
   .topbar .menu-btn{background:transparent;border:none;color:#fff;font-size:24px;cursor:pointer;line-height:1;padding:2px 6px}
+  .topbar .tb-link{display:inline-block;margin-left:auto;color:#fff;text-decoration:none;font-weight:bold;font-size:14px;padding:4px 10px;border:1px solid rgba(255,255,255,.65);border-radius:6px}
   .topbar span{font-size:16px;font-weight:bold}
   .overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:999}
   body.nav-open .overlay{display:block}
@@ -533,7 +612,7 @@ EXTRA_CSS = """
   nav.open{transform:translateX(0)}
   main{padding:62px 12px 16px;overflow:visible;height:auto}
   .grid{gap:10px;margin-top:8px}
-  .card{width:calc(50% - 5px)}
+  .card{width:calc(33.33% - 7px)}
   .card img,.card .cv{width:100%;height:auto;aspect-ratio:116/162}
   .card .t{font-size:11px;height:28px}
   .sch{flex-direction:column;gap:8px}
@@ -545,7 +624,7 @@ EXTRA_CSS = """
   .row{gap:10px}
 }
 @media(max-width:400px){
-  .card{width:calc(50% - 4px)}
+  .card{width:calc(33.33% - 6px)}
   .card .t{font-size:10px}
 }
 /* ===== P2-B 主题变量 + 暗色覆盖层（不改动原浅色样式） ===== */
@@ -596,13 +675,17 @@ EXTRA_CSS = """
   /* 侧栏宽度随屏宽流体缩放，而非死固定 250px */
   nav{ width: clamp(210px, 16vw, 260px); }
   /* 书卡网格：随可用宽度自动铺满、列数自适应，大小屏都均匀 */
-  .grid{ display:grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap:16px; }
+  /* 116px = 卡片设计宽度(.card{width:116px})。用 116 而非 118 才能在 2560px 宽屏排满 17 列
+     (85 本 = 5 排)；原 118px 会被 auto-fill 压到 16 列。 */
+  .grid{ display:grid; grid-template-columns: repeat(auto-fill, minmax(116px, 1fr)); gap:16px; }
   .card{ width:auto; }
   .card img, .card .cv{ width:100%; height:auto; aspect-ratio:116/162; }
 }
 /* 超宽屏：限制主内容最大宽度并居中，避免被拉得过散 */
 @media (min-width: 1700px){
-  main{ max-width:1500px; margin:0 auto; }
+  /* 原 max-width:1500px 会把超宽屏内容锁死，导致列数上不去(最多约 11 列)。
+     改为随视口流体放大并设 2800px 上限，保证卡片不会在大屏上被拉得过大。 */
+  main{ max-width: clamp(1500px, 94vw, 2800px); margin:0 auto; }
 }
 """
 
@@ -1352,7 +1435,7 @@ def _find_tesseract():
     if ts:
         return ts
     for cand in (
-        r"F:\my-library\tools\tesseract_ocr\tesseract.exe",
+        r"G:\my-library\tools\tesseract_ocr\tesseract.exe",
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
     ):
@@ -1368,7 +1451,7 @@ def _ocr_pdf(file_path, max_pages=15):
         return ""
     # OCR 临时文件统一写到项目盘(F)下的可写目录, 避免沙箱/权限禁止写入系统 Temp
     # 导致 tesseract 输出写不进去、OCR 静默失败(整本回落书名)。
-    _ocr_tmp = r"F:\my-library\tools\ocr_tmp"
+    _ocr_tmp = r"G:\my-library\tools\ocr_tmp"
     try:
         _os.makedirs(_ocr_tmp, exist_ok=True)
     except Exception:
@@ -1386,17 +1469,36 @@ def _ocr_pdf(file_path, max_pages=15):
         texts = []
         for i in range(pages):
             # 自适应降分辨率：tesseract 单维像素上限约 32767px，超限会报
-            # "Image too large" 拒绝。逐档(200→150→100→72)尝试，取到首个
-            # 最大边<=32000px 的渲染；仍超限则至少交最后一档给 tesseract 试。
+            # "Image too large" 拒绝。
+            # 关键修正(2026-08-30)：原逻辑只固定降档(200→150→100→72)，对**超大幅面
+            # 扫描页**(页面尺寸达几万 pt)即使 72dpi 渲染后仍远超 32000px → fitz/tesseract
+            # 直接拒绝 → 整本回落书名(本库 4536 本未抽 PDF 绝大多数属此类)。
+            # 现改为：先按页面 pt 尺寸动态反推一个 dpi，使渲染最大边 <=8000px(留充足余量)，
+            # 再在"不超过该 dpi"的固定档里挑；若固定档全部超限，则用动态 dpi 兜底渲染。
+            page = doc[i]
             pix = None
+            try:
+                _max_pt = max(page.rect.width, page.rect.height) or 1.0
+            except Exception:
+                _max_pt = 1.0
+            _dpi_fit = int(8000 * 72 / _max_pt)
+            _dpi_fit = max(12, min(200, _dpi_fit))
             for dpi in (200, 150, 100, 72):
+                if dpi > _dpi_fit:
+                    continue  # 该档渲染后仍会超限, 直接跳过不再浪费渲染
                 try:
-                    p = doc[i].get_pixmap(dpi=dpi)
+                    p = page.get_pixmap(dpi=dpi)
                 except Exception:
                     continue
                 pix = p
                 if max(p.width, p.height) <= 32000:
                     break
+            if pix is None:
+                # 所有固定档都超限(超大幅面页): 用动态算出的 dpi 兜底再试一次
+                try:
+                    pix = page.get_pixmap(dpi=_dpi_fit)
+                except Exception:
+                    pix = None
             if pix is None:
                 continue
             tmp = tempfile.NamedTemporaryFile(dir=_ocr_tmp, suffix=".png", delete=False).name
@@ -1409,13 +1511,22 @@ def _ocr_pdf(file_path, max_pages=15):
             try:
                 # 写到临时 txt(tesseract 默认以 UTF-8 写文件), 再读回, 规避 Windows 下
                 # tesseract 经 stdout 输出 GBK 导致 Python text=True 解码崩溃、整页丢字的问题。
-                out_txt = tempfile.NamedTemporaryFile(dir=_ocr_tmp, suffix=".txt", delete=False).name
+                # 关键修正(2026-08-30): tesseract 的第二个位置参数是"输出基名", 它会自行补 .txt 后缀。
+                # 原代码传入已带 .txt 的临时文件名 -> 文字实际写到 "xxx.txt.txt",
+                # 而这里读的是空的 "xxx.txt" -> 所有 OCR 结果恒为空(静默 bug, 导致
+                # 历史上 tesseract 从未成功输出过一个字, 全部误判为"OCR 不可用")。
+                out_base = tempfile.NamedTemporaryFile(dir=_ocr_tmp, suffix="", delete=False).name
                 tessdata_dir = _os.path.join(_os.path.dirname(ts), "tessdata")
-                r = _sp.run([ts, tmp, out_txt, "-l", "chi_sim+eng", "--tessdata-dir", tessdata_dir], capture_output=True, timeout=120)
+                r = _sp.run([ts, tmp, out_base, "-l", "chi_sim+eng", "--tessdata-dir", tessdata_dir], capture_output=True, timeout=120)
+                out_txt = out_base + ".txt"
+                if r.returncode != 0:
+                    print(f"[tesseract rc={r.returncode}] {str(r.stderr)[:200]}", flush=True)
                 if r.returncode == 0 and _os.path.exists(out_txt):
                     with open(out_txt, "r", encoding="utf-8", errors="ignore") as _f:
                         texts.append(_f.read())
                 try: _os.remove(out_txt)
+                except Exception: pass
+                try: _os.remove(out_base)
                 except Exception: pass
             except Exception:
                 pass
@@ -1435,6 +1546,8 @@ def _ocr_unlimited(file_path, max_pages=20):
     WorkBuddy 注入的 PYTHONPATH(含 safe-delete shim) 与 ACC_PRODUCT_CONFIG_V3 会干扰子进程 torch 加载, 必须清除。
     返回过滤后的纯正文(text/title/header/footer); 失败/不可用返回 ''。"""
     import subprocess as _sp, os as _os, re as _re
+    if _os.environ.get("LIB_SKIP_UNLIMITED_OCR"):
+        return ""
     cli = r"E:\Workbuddy\Unlimited-OCR\uocr_cli.py"
     vpy = r"E:\Workbuddy\Unlimited-OCR\.venv_uocr\Scripts\python.exe"
     if not (_os.path.exists(cli) and _os.path.exists(vpy)):
@@ -3317,7 +3430,7 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
         pn=qs.get('p',['home'])[0]
         cat=qs.get('cat',[''])[0]; sub=qs.get('sub',[''])[0]
         nv=NAV.replace('{B}',str(tb)).replace('{M}',str(tm)).replace('{TREE}', build_cat_tree(cat, sub)).replace('{SHELVES}', build_shelves()).replace('{N}', str(tn))
-        h='<!DOCTYPE html><html><head><meta charset=utf-8><title>我的图书馆</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>'+CSS+EXTRA_CSS+'</style></head><body>'+nv+'<div class="topbar"><button class="menu-btn" onclick="toggleNav()">☰</button><span>📚 我的图书馆</span></div><div class="overlay" onclick="toggleNav()"></div><main>'
+        h='<!DOCTYPE html><html><head><meta charset=utf-8><title>我的图书馆</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>'+CSS+EXTRA_CSS+'</style></head><body>'+nv+'<div class="topbar"><button class="menu-btn" onclick="toggleNav()">☰</button><span>📚 我的图书馆</span><a class="tb-link" href="/?p=books">📖书库</a></div><div class="overlay" onclick="toggleNav()"></div><main>'
         if pn=='books':
             q=qs.get('q',[''])[0];cat=qs.get('cat',[''])[0];sub=qs.get('sub',[''])[0];fmt=qs.get('fmt',[''])[0]
             diff=qs.get('diff',[''])[0];rstat=qs.get('rstat',[''])[0]
@@ -3380,7 +3493,7 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
         elif pn=='detail':
             bid=qs.get('id',[None])[0];is_media=qs.get('type',[''])[0]=='media'
             if bid and not is_media:
-                r=dbq("SELECT id,title,subtitle,publisher,publish_date,isbn,language,description,cover_path,file_path,file_format,file_size,page_count,summary,summary_model,summary_updated,difficulty,status,reading_status,last_page,created_at FROM books WHERE id=?",(bid,))
+                r=dbq("SELECT id,title,subtitle,publisher,publish_date,isbn,language,description,metadata_source,metadata_conf,cover_path,file_path,file_format,file_size,page_count,summary,summary_model,summary_updated,difficulty,status,reading_status,last_page,created_at FROM books WHERE id=?",(bid,))
                 if r:
                     b=r[0];a=dbq("SELECT a.name FROM authors a JOIN book_authors ba ON a.id=ba.author_id WHERE ba.book_id=?",(bid,))
                     c=dbq("SELECT c.name FROM categories c JOIN book_categories bc ON c.id=bc.category_id WHERE bc.book_id=?",(bid,))
@@ -3390,9 +3503,16 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
                     h+='<div class=meta>'
                     if a:h+='<p><b>作者:</b> '+', '.join([he(x['name'])for x in a])+'</p>'
                     h+='<p><b>格式:</b> '+str(b['file_format']).upper()+' | <b>大小:</b> '+str(round(b['file_size']/1024/1024,1))+'MB | <b>页数:</b> '+str(b['page_count']or'-')+'</p>'
+                    if b['subtitle']:h+='<p><b>副标题:</b> '+he(str(b['subtitle']))+'</p>'
                     if b['publisher']:h+='<p><b>出版社:</b> '+he(str(b['publisher']))+'</p>'
+                    if b['publish_date']:h+='<p><b>出版:</b> '+he(str(b['publish_date']))+'</p>'
                     if b['isbn']:h+='<p><b>ISBN:</b> '+str(b['isbn'])+'</p>'
+                    if b['language']:h+='<p><b>语言:</b> '+he(str(b['language']))+'</p>'
+                    _ms=b.get('metadata_source') or ''; _mc=b.get('metadata_conf') or 0
+                    if _ms:h+='<p class=co style="font-size:12px">📡 数据来源: '+he(str(_ms))+(' · 置信度 %.0f%%'%(float(_mc)*100) if _mc else '')+'</p>'
                     h+='</div><div style="clear:both"></div>'
+                    if b['description']:
+                        h+='<div class=sec><h3>📖 内容简介</h3><div style="white-space:pre-wrap;line-height:1.8;background:#f9f9f9;padding:16px;border-radius:8px;margin-top:8px">'+he(str(b['description']))+'</div></div>'
                     # 阅读状态控制（P0）
                     rs=b.get('reading_status') or 'unread'; lp=b.get('last_page') or 0
                     h+='<div class=sec><b>阅读状态:</b> '
@@ -3595,7 +3715,11 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             total = st['total_books']; tm = st['total_media']
             cov = st['coverage']
             h+='<h2>📊 图书馆统计</h2>'
-            h+='<div class=panel><h3>🧹 摘要健康</h3><p class=co>当前仍有 <b style="color:#c0392b">'+str(st.get('fake_summary',0))+'</b> 本<b>假摘要</b>（导入时无正文被 LLM 编的模板示例，典型首句「由于提供的内容为空白…」）。其中<b>无全文</b>的将清空、<b>有全文</b>的可经本机 Ollama 重跑真摘要。处理方式：工具中心「③ 摘要修复」→「🔥 全量修复」（需 Ollama 在线）。</p></div>'
+            _fake = st.get('fake_summary', 0)
+            if _fake > 0:
+                h+='<div class=panel><h3>🧹 摘要健康</h3><p class=co>当前仍有 <b style="color:#c0392b">'+str(_fake)+'</b> 本<b>假摘要</b>（导入时无正文被 LLM 编的模板示例，典型首句「由于提供的内容为空白…」）。其中<b>无全文</b>的将清空、<b>有全文</b>的可经本机 Ollama 重跑真摘要。处理方式：工具中心「③ 摘要修复」→「🔥 全量修复」（需 Ollama 在线）。</p></div>'
+            else:
+                h+='<div class=panel><h3>🧹 摘要健康</h3><p class=co style="color:#389e0d">✅ <b>摘要全部健康</b>：无假摘要、无待修复项。有正文的书籍均已生成真实 AI 摘要；无正文的已正确清空（不冒充有摘要）。</p></div>'
             h+='<div class=panel><h3>📦 规模</h3><div class=row>'
             h+='<a class=sb><div class=n style=color:#1677ff>'+str(total)+'</div><div class=l>📚 书籍</div></a>'
             h+='<a class=sb><div class=n style=color:#fa8c16>'+str(tm)+'</div><div class=l>🎧 媒体</div></a></div></div>'
@@ -3622,7 +3746,12 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             h+='<table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f3f3f3"><th style="border:1px solid #ddd;padding:6px;text-align:left">工具</th><th style="border:1px solid #ddd;padding:6px;text-align:left">实际完成</th><th style="border:1px solid #ddd;padding:6px;text-align:left">总量</th><th style="border:1px solid #ddd;padding:6px;text-align:left">完成率</th><th style="border:1px solid #ddd;padding:6px;text-align:left">续跑 done</th><th style="border:1px solid #ddd;padding:6px;text-align:left">续跑 skip</th><th style="border:1px solid #ddd;padding:6px;text-align:left">状态</th></tr>'
             for t,v in st['tools'].items():
                 run='🟢 运行中' if v.get('running') else '⚪ 空闲'
-                rc = _real.get(t, _real.get(t.split('_')[0], 0)) if t!='metadata' else _real.get('meta',0)
+                if t=='metadata':
+                    rc = _real.get('meta',0)
+                elif t=='summary':
+                    rc = cov.get('summary',0)
+                else:
+                    rc = _real.get(t, _real.get(t.split('_')[0], 0))
                 sc = _scope.get(t, total)
                 pctv = ('%.1f'%(rc*100.0/sc)) if sc else '0.0'
                 comp = ('%d'%rc) if t!='summary' else ('%d（待修 %d）'%(cov.get('summary',0), st.get('fake_summary',0)))
@@ -3683,23 +3812,43 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             _ld=""
             h+='<h2>🏠 首页</h2>'
             h+='<div class=row><a href="/?p=books" class=sb><div class=n style=color:#1677ff>'+str(tb)+'</div><div class=l>📚 书籍</div></a><a href="/?p=detail&list=1" class=sb><div class=n style=color:#52c41a>'+str(ts)+'</div><div class=l>🤖 已摘要</div></a><a href="/?p=media" class=sb><div class=n style=color:#fa8c16>'+str(tm)+'</div><div class=l>🎧 媒体</div></a><a href="/?p=media_transcribed" class=sb><div class=n style=color:#13c2c2>'+str(ct.get("mtr",0))+'</div><div class=l>🎙️ 已转录</div></a><a href="/?p=media_summarized" class=sb><div class=n style=color:#eb2f96>'+str(ct.get("msu",0))+'</div><div class=l>📝 媒体摘要</div></a></div>'
-            h+='<div class=panel><h3>🤖 AI 处理</h3><p class=co style=margin-bottom:8px>未分类: '+str(import_rem)+' 本 | 未摘要: '+str(sum_rem)+' 本 | 无文本: '+str(no_text)+' 本'+_ld+' ｜ 🤖 AI 摘要已升级为智能跑批：先修「假摘要」(有正文重跑/无正文清空)再补真正缺失的，无正文自动跳过</p>'
-            h+='<div style="margin-bottom:8px"><label style=font-size:13px>分类数量 </label><select id=clsCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=5>5 本</option><option value=10 selected>10 本</option><option value=20>20 本</option><option value=50>50 本</option><option value=100>100 本</option><option value=500>500 本</option><option value=1000>1000 本</option></select> <button class=btn id=clsBtn onclick="CLS()" style=margin-right:8px>🤖 AI 分类</button></div>'
-            h+='<div style="margin-bottom:8px"><label style=font-size:13px>摘要数量 </label><select id=sumCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=1>1 本</option><option value=3 selected>3 本</option><option value=5>5 本</option><option value=10>10 本</option><option value=20>20 本</option><option value=100>100 本</option><option value=500>500 本</option><option value=1000>1000 本</option></select> <button class=btn id=sumBtn onclick="SUM()">🤖 AI 摘要</button></div>'
-            h+='<div><label style=font-size:13px>提取数量 </label><select id=extCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=5>5 本</option><option value=10 selected>10 本</option><option value=20>20 本</option><option value=50>50 本</option><option value=100>100 本</option><option value=500>500 本</option><option value=1000>1000 本</option></select> <button class=btn id=extBtn onclick="EXT()">📄 提取文本</button></div>'
-            h+='<div style="margin:10px 0 4px;font-size:12px;color:#888;border-top:1px dashed #eee;padding-top:8px">🌐 在线元数据补全（主源豆瓣，中文书覆盖好；默认关，start.bat 已自动启用）</div>'
-            h+='<div style="margin-bottom:8px"><label style=font-size:13px>元数据数量 </label><select id=metaCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=0 selected>全部</option><option value=10>10 本</option><option value=50>50 本</option><option value=100>100 本</option><option value=500>500 本</option><option value=1000>1000 本</option></select> <button class=btn id=metaBtn onclick="META()" style=background:#13c2c2>🌐 补全元数据</button></div>'
-            h+='<div id=clsRes style=margin-top:4px;font-size:13px></div><div id=sumRes style=margin-top:4px;font-size:13px></div><div id=extRes style=margin-top:4px;font-size:13px></div><div id=metaRes style=margin-top:4px;font-size:13px></div></div>'
-            #媒体库转录、摘要面板20260801
-            h+='<div class=panel><h3>🎙️ 媒体转录与摘要</h3><p class=co style=margin-bottom:8px>待转录: '+str(tm - ct.get("mtr",0))+' 个 | 已转录待摘要: '+str(ct.get("mtr",0) - ct.get("msu",0))+' 个</p>'
-            h+='<div style="margin-bottom:8px"><label style=font-size:13px>转录数量 </label><select id=trsCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=5>5 个</option><option value=10 selected>10 个</option><option value=50>50 个</option><option value=100>100 个</option><option value=500>500 个</option></select> <select id=trsType style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=all>全部媒体</option><option value=audio>仅音频</option><option value=video>仅视频</option></select> <button class=btn id=trsBtn onclick="TRS()">🎙️ 媒体转录</button></div>'
-            h+='<div><label style=font-size:13px>摘要数量 </label><select id=msuCnt style="padding:4px 8px;border:1px solid #ddd;border-radius:4px"><option value=50>50 个</option><option value=100 selected>100 个</option><option value=500>500 个</option><option value=1000>1000 个</option></select> <button class=btn id=msuBtn onclick="MSU()" style=background:#eb2f96>📝 转录→摘要</button></div>'
-            h+='<div style="margin-top:8px;border-top:1px dashed #eee;padding-top:8px;font-size:12px;color:#888">⚠️ 历史修复（确认 ffmpeg/独显就绪后跑）</div>'
-            h+='<div style="margin-bottom:6px"><button class=btn id=trsRBtn onclick="TRSR()" style="background:#fa8c16">🔁 重试失败转录</button> <span id=trsRRes style=font-size:13px></span></div>'
-            h+='<div><button class=btn id=mslBtn onclick="MSUL()" style="background:#722ed1">🔁 重摘要超长媒体(>8000字)</button> <span id=mslRes style=font-size:13px></span></div>'
-            h+='<div id=trsRes style=margin-top:4px;font-size:13px></div><div id=msuRes style=margin-top:4px;font-size:13px></div></div>'
-    
-            #媒体库转录、摘要面板20260801结束
+            # ===== 最近添加（按 rowid 倒序 = 实际导入顺序，不依赖 created_at）=====
+            try:
+                _recent = dbq("SELECT id,title,cover_path FROM books WHERE status='active' ORDER BY rowid DESC LIMIT 17")
+            except Exception:
+                _recent = []
+            h+='<div class=panel><h3>🆕 最近添加</h3>'
+            if _recent:
+                h+='<div class=grid>'
+                for _r in _recent:
+                    _cv=('<img src="/api/covers/'+_r['id']+'.jpg" alt="">') if _r['cover_path'] else '<div class=cv>📚</div>'
+                    h+='<a class=card href="/?p=detail&id='+_r['id']+'">'+_cv+'<div class=t>'+he(_r['title'])[:44]+'</div></a>'
+                h+='</div>'
+            else:
+                h+='<p class=co>暂无书籍</p>'
+            h+='</div>'
+            # ===== 数据健康度（4 条轻量 COUNT；不用 _lib_stats，避免全表扫 summary 拖慢首页）=====
+            _tot2 = tb or 1
+            try:
+                _n_tx=dbq("SELECT COUNT(*) c FROM books WHERE status='active' AND text_extracted=1")[0]['c']
+                _n_sm=dbq("SELECT COUNT(*) c FROM books WHERE status='active' AND summary IS NOT NULL AND summary<>''")[0]['c']
+                _n_cv=dbq("SELECT COUNT(*) c FROM books WHERE status='active' AND cover_path IS NOT NULL AND cover_path<>''")[0]['c']
+                _n_ct=dbq("SELECT COUNT(DISTINCT bc.book_id) c FROM book_categories bc JOIN books b ON b.id=bc.book_id WHERE b.status='active'")[0]['c']
+            except Exception:
+                _n_tx=_n_sm=_n_cv=_n_ct=0
+            h+='<div class=panel><h3>💚 数据健康度</h3><div class=row>'
+            for _lab,_n,_col in (('正文',_n_tx,'#52c41a'),('摘要',_n_sm,'#1677ff'),('封面',_n_cv,'#13c2c2'),('分类',_n_ct,'#fa8c16')):
+                _p=min(100, round((_n or 0)*100.0/_tot2,1))
+                h+=('<div style="flex:1 1 150px;min-width:140px"><div style="font-size:12px;color:#666">%s '
+                    '<b style="color:%s">%s%%</b></div>'
+                    '<div style="background:#eee;height:8px;border-radius:4px;margin-top:4px">'
+                    '<div style="background:%s;height:8px;border-radius:4px;width:%s%%"></div></div>'
+                    '<div style="font-size:11px;color:#999;margin-top:2px">%d / %d</div></div>') % (_lab,_col,_p,_col,_p,_n or 0,_tot2)
+            h+='</div>'
+            h+='<p class=co style="margin-top:8px">未分类 '+str(import_rem)+' 本 · 未提取正文 '+str(no_text)+' 本 · 未摘要 '+str(max(0, tb-ts))+' 本　需处理请前往 <a href="/?p=tools">🛠️ 工具中心</a>。</p>'
+            h+='</div>'
+            # 媒体转录/摘要工具已于 2026-08-30 移至「🛠️ 工具中心 → 🎧 媒体处理流水线」，
+            # 首页不再重复放置执行控件，避免两处入口不一致。
             h+='<div class=panel><h3>📊 格式分布</h3>'
             fmt_dist = ct.get("fmt_dist", [])
             if not fmt_dist:
