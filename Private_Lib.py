@@ -3723,11 +3723,30 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             h+='<div class=panel><h3>📦 规模</h3><div class=row>'
             h+='<a class=sb><div class=n style=color:#1677ff>'+str(total)+'</div><div class=l>📚 书籍</div></a>'
             h+='<a class=sb><div class=n style=color:#fa8c16>'+str(tm)+'</div><div class=l>🎧 媒体</div></a></div></div>'
-            h+='<div class=panel><h3>🧬 数据覆盖率（按 '+str(total)+' 本书计）</h3><table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f3f3f3"><th style="border:1px solid #ddd;padding:6px;text-align:left">字段</th><th style="border:1px solid #ddd;padding:6px;text-align:left">已填</th><th style="border:1px solid #ddd;padding:6px;text-align:left">覆盖率</th><th style="border:1px solid #ddd;padding:6px;text-align:left">进度</th></tr>'
+            # —— 未达标原因 / 待办（动态计算）——
+            _tx_gap = total - cov.get('text_extracted',0)
+            _tx_fmt = {}
+            for _r in dbq("SELECT file_format f, COUNT(*) c FROM books WHERE status='active' AND (text_extracted=0 OR text_extracted IS NULL) GROUP BY file_format"):
+                _tx_fmt[_r['f']] = _r['c']
+            _tx_fallback = dbq("SELECT COUNT(*) c FROM books b WHERE b.status='active' AND (b.text_extracted=0 OR b.text_extracted IS NULL) AND b.id IN (SELECT id FROM book_text bt WHERE bt.text_content IS NOT NULL AND length(bt.text_content)<=200)")[0]['c']
+            _sum_gap = total - cov.get('summary',0)
+            _sum_can = dbq("SELECT COUNT(*) c FROM books b WHERE b.status='active' AND (b.summary IS NULL OR b.summary='') AND b.text_extracted=1")[0]['c']
+            _m_tr = dbq("SELECT COUNT(*) c FROM media WHERE status='active' AND transcript IS NOT NULL AND transcript NOT LIKE '[转录失败%' AND transcript NOT LIKE '[转录超时%' AND transcript!='[文件不存在]' AND transcript NOT LIKE '[分段转录失败%'")[0]['c']
+            _m_su = dbq("SELECT COUNT(*) c FROM media WHERE status='active' AND summary IS NOT NULL AND summary NOT LIKE '[摘要%' AND summary NOT LIKE '[无可转录%' AND summary!='[摘要结果为空]'")[0]['c']
+            _causes = {
+              'cover': '已基本完成（仅 %d 本缺，多为损坏/无图源文件），无需处理' % (total - cov.get('cover',0)),
+              'summary': '缺 %d 本：%d 本已有正文 → 可在「工具中心 ③ AI 摘要」立即生成；%d 本需先跑「② 提取正文」' % (_sum_gap, _sum_can, _sum_gap - _sum_can),
+              'publisher': '缺 %d 本。元数据补全按 ISBN 在线匹配，库内大量无 ISBN 的 upload_ 乱码命名书无法自动匹配，已尽力；剩余需手动补全或导入时带元数据' % (total - cov.get('publisher',0)),
+              'isbn': '缺 %d 本，同出版社：无 ISBN 无法在线匹配' % (total - cov.get('isbn',0)),
+              'language': '缺 %d 本，同出版社：在线匹配未命中' % (total - cov.get('language',0)),
+              'text_extracted': '缺 %d 本：PDF 扫描版 %d（无文字层，需 OCR）、压缩包 %d（rar/zip 无解压库）、其他 %d；其中 %d 本已书名兜底（解析/OCR 失败仅写入标题）' % (_tx_gap, _tx_fmt.get('pdf',0), _tx_fmt.get('rar',0)+_tx_fmt.get('zip',0), _tx_gap-_tx_fmt.get('pdf',0)-_tx_fmt.get('rar',0)-_tx_fmt.get('zip',0), _tx_fallback),
+              'named': '已规则化 %d 本；未变多为 upload_ 无解书名，可在「书名规则化对比表」手动采纳' % cov.get('named',0),
+            }
+            h+='<div class=panel><h3>🧬 数据覆盖率（按 '+str(total)+' 本书计）</h3><table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f3f3f3"><th style="border:1px solid #ddd;padding:6px;text-align:left">字段</th><th style="border:1px solid #ddd;padding:6px;text-align:left">已填</th><th style="border:1px solid #ddd;padding:6px;text-align:left">覆盖率</th><th style="border:1px solid #ddd;padding:6px;text-align:left">进度</th><th style="border:1px solid #ddd;padding:6px;text-align:left">未达标原因 / 还需做什么</th></tr>'
             labels={'cover':'封面','summary':'简介','publisher':'出版社','isbn':'ISBN','language':'语言','text_extracted':'全文提取','named':'已规则化命名'}
             for k,lab in labels.items():
                 v=cov.get(k,0); pct=(v*100.0/total) if total else 0
-                h+='<tr><td style="border:1px solid #ddd;padding:6px">'+lab+'</td><td style="border:1px solid #ddd;padding:6px">'+str(v)+'</td><td style="border:1px solid #ddd;padding:6px">'+('%.1f'%(pct))+'%</td><td style="border:1px solid #ddd;padding:6px;width:220px"><div style="background:#1677ff;height:10px;border-radius:5px;width:'+str(min(100,pct))+'%"></div></td></tr>'
+                h+='<tr><td style="border:1px solid #ddd;padding:6px">'+lab+'</td><td style="border:1px solid #ddd;padding:6px">'+str(v)+'</td><td style="border:1px solid #ddd;padding:6px">'+('%.1f'%(pct))+'%</td><td style="border:1px solid #ddd;padding:6px;width:160px"><div style="background:#1677ff;height:10px;border-radius:5px;width:'+str(min(100,pct))+'%"></div></td><td style="border:1px solid #ddd;padding:6px;font-size:12px;color:#555">'+_causes.get(k,'')+'</td></tr>'
             h+='</table></div>'
             h+='<div class=panel><h3>🛠️ 工具完成情况 + 续跑情况</h3>'
             h+='<p class=co>「实际完成」来自数据库真实统计（导入期与手动触发都已计入），「续跑」来自 progress.db 的离线批处理计数（仅统计本次会话经工具中心跑批的量，进程崩溃可续跑）。二者互补：前者看成果、后者看跑批进度。</p>'
@@ -3757,6 +3776,14 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
                 comp = ('%d'%rc) if t!='summary' else ('%d（待修 %d）'%(cov.get('summary',0), st.get('fake_summary',0)))
                 h+='<tr><td style="border:1px solid #ddd;padding:6px">'+tnames.get(t,t)+'</td><td style="border:1px solid #ddd;padding:6px">'+comp+'</td><td style="border:1px solid #ddd;padding:6px">'+str(sc)+'</td><td style="border:1px solid #ddd;padding:6px">'+pctv+'%</td><td style="border:1px solid #ddd;padding:6px">'+str(v.get('done',0))+'</td><td style="border:1px solid #ddd;padding:6px">'+str(v.get('skip',0))+'</td><td style="border:1px solid #ddd;padding:6px">'+run+'</td></tr>'
             h+='</table></div>'
+            # —— 下一步待办（汇总，直接回答「还需做什么」）——
+            h+='<div class=panel><h3>📋 下一步待办（按优先级）</h3><ol class=co style="line-height:1.95;margin:6px 0 6px 18px">'
+            h+='<li><b>① 提取正文（优先级最高）</b>：仍有 <b style="color:#fa8c16">%d</b> 本未提取 —— PDF 扫描版 %d（无文字层，需 OCR）、压缩包 %d（rar/zip 无解压库）、其他 %d；其中 <b>%d 本已「书名兜底」</b>（解析/OCR 曾失败、仅写入标题）。→ 工具中心「📚 书籍流水线 · ② 提取正文」（已修复 tesseract 动态 dpi，纯 CPU 4 并发，比 GPU 方案快数十倍）。</li>' % (_tx_gap, _tx_fmt.get('pdf',0), _tx_fmt.get('rar',0)+_tx_fmt.get('zip',0), _tx_gap-_tx_fmt.get('pdf',0)-_tx_fmt.get('rar',0)-_tx_fmt.get('zip',0), _tx_fallback)
+            h+='<li><b>② AI 摘要</b>：未摘要 %d 本，其中 <b style="color:#52c41a">%d 本已有正文、可立即摘要</b>（工具中心「③ AI 摘要」一键生成），其余 %d 本需先完成上面的「① 提取正文」。</li>' % (_sum_gap, _sum_can, _sum_gap-_sum_can)
+            h+='<li><b>③ 在线元数据</b>：出版社缺 %d / ISBN 缺 %d / 语言缺 %d。自动匹配已尽力；剩余多为<b>无 ISBN 的 upload_ 乱码命名书</b>，无法在线匹配，需手动补全或后续导入时带元数据（工具中心「⚙️ 辅助 · 在线元数据」可重跑未命中项）。</li>' % (total-cov.get('publisher',0), total-cov.get('isbn',0), total-cov.get('language',0))
+            h+='<li><b>④ 媒体转录/摘要</b>：%d 个媒体未转录也未摘要（转录失败的文件无摘要），属音频质量/编码客观边界；可在工具中心「🎧 媒体流水线」重试失败项。</li>' % (tm - _m_tr)
+            h+='<li><b>⑤ 书名规则化</b>：%d 本已改写；未变多为 upload_ 无解书名，可在「<a href="/?p=title-norm">书名规则化对比表</a>」手动采纳真实书名或删除。</li>' % cov.get('named',0)
+            h+='</ol><p class=co>说明：所有「抽取 / OCR / 元数据 / 摘要」工具均支持<b>断点续跑</b>（progress.db 记录 done/skip），进程崩溃不白跑；长任务建议经工具中心触发，避免在网页外裸跑被回收。</p></div>'
         elif pn=='title-norm':
             h+='<h2>📐 书名规则化对比表</h2>'
             _tn_page=int(qs.get('page',['1'])[0]); _tn_mode=qs.get('mode',['all'])[0]; _tn_q=qs.get('q',[''])[0]; _tn_ps=50
