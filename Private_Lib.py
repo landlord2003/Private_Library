@@ -387,7 +387,7 @@ def _tool_center_html():
     h += '<div style="display:flex;flex-wrap:wrap">'
     ext_n = cov.get('text_extracted',0)
     h += card('📄','提取文本',
-        '抽取 PDF/EPUB/MOBI/TXT 正文存入 book_text，供 AI 摘要、知识图谱、全文检索。PDF 仅取前 5–30 页、上限 20 万字；&gt;1500MB 超大文件回落书名；其余扫描版先 Unlimited-OCR、tesseract 兜底。',
+        '抽取 PDF/EPUB/MOBI/TXT 正文存入 book_text，供 AI 摘要、知识图谱、全文检索。Web 路径对扫描版 PDF 仅用轻量 tesseract(CPU) OCR；&gt;1500MB 超大文件回落书名。重型无文字层扫描书请用下方「📷 扫描版OCR」走 Unlimited-OCR 流水线。',
         '%d / %d 本 (%.1f%%)' % (ext_n, total, pct(ext_n)), ext_n, '#52c41a',
         '/?p=stats', '查看全文提取覆盖率',
         '<button class=btn onclick="EXTR()">▶ 全量抽取(续跑)</button> <span id=offExtRes></span>')
