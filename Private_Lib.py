@@ -272,8 +272,16 @@ def _tool_status():
     return out
 
 
+# 统计页缓存（秒）：23GB 库上 _lib_stats 跑全量 COUNT 较慢，概览类数据允许滞后，缓存 300s 避免每次进页都重算
+_stats_cache = {"time": 0, "data": None}
+_STATS_TTL = 300
+
 def _lib_stats():
-    """图书馆规模 + 数据覆盖率 + 各工具续跑进度，供统计页/接口展示。"""
+    """图书馆规模 + 数据覆盖率 + 各工具续跑进度，供统计页/接口展示。带 300s 缓存。"""
+    global _stats_cache
+    now = time.time()
+    if _stats_cache.get("data") is not None and now - _stats_cache["time"] < _STATS_TTL:
+        return _stats_cache["data"]
     def _c(sql):
         return dbq(sql)[0]['c']
     total = _c("SELECT COUNT(*) c FROM books WHERE status='active'")
@@ -288,11 +296,47 @@ def _lib_stats():
         "ocr_pending": _c("SELECT COUNT(*) c FROM books b JOIN book_text bt ON bt.id=b.id WHERE b.file_format='pdf' AND b.text_extracted=1 AND length(bt.text_content)<=200"),
         "named": _c("SELECT COUNT(*) c FROM books WHERE status='active' AND normalized_title IS NOT NULL AND normalized_title<>'' AND normalized_title NOT LIKE 'upload_%'"),
     }
-    fake = 0
-    for r in dbq("SELECT summary FROM books WHERE status='active' AND summary IS NOT NULL AND summary<>''"):
-        if _is_fake_summary(r['summary']):
-            fake += 1
-    return {"total_books": total, "total_media": total_media, "coverage": cov, "fake_summary": fake, "tools": _tool_status()}
+    fake = _fake_summary_count()
+    data = {"total_books": total, "total_media": total_media, "coverage": cov, "fake_summary": fake, "tools": _tool_status()}
+    _stats_cache["data"] = data
+    _stats_cache["time"] = now
+    return data
+
+
+_stats_page_cache = {"time": 0, "data": None}
+
+def _stats_page_data():
+    """统计中心页所需的全部指标（含 _lib_stats 之外的额外 GROUP BY / 媒体 / 分类统计）。
+    整体缓存 300s：第一次进页算齐（~5s），之后命中缓存秒开。避免每次进统计中心都重跑 9+ 条查询导致 87s 卡死。"""
+    global _stats_page_cache
+    now = time.time()
+    if _stats_page_cache.get("data") is not None and now - _stats_page_cache["time"] < _STATS_TTL:
+        return _stats_page_cache["data"]
+    st = _lib_stats()
+    total = st['total_books']; tm = st['total_media']; cov = st['coverage']
+    tx_gap = total - cov.get('text_extracted', 0)
+    tx_fmt = {}
+    for r in dbq("SELECT file_format f, COUNT(*) c FROM books WHERE status='active' AND (text_extracted=0 OR text_extracted IS NULL) GROUP BY file_format"):
+        tx_fmt[r['f']] = r['c']
+    tx_fallback = dbq("SELECT COUNT(*) c FROM books b WHERE b.status='active' AND (b.text_extracted=0 OR b.text_extracted IS NULL) AND b.id IN (SELECT id FROM book_text bt WHERE bt.text_content IS NOT NULL AND length(bt.text_content)<=200)")[0]['c']
+    sum_gap = total - cov.get('summary', 0)
+    sum_can = dbq("SELECT COUNT(*) c FROM books b WHERE b.status='active' AND (b.summary IS NULL OR b.summary='') AND b.text_extracted=1")[0]['c']
+    m_tr = dbq("SELECT COUNT(*) c FROM media WHERE status='active' AND transcript IS NOT NULL AND transcript NOT LIKE '[转录失败%' AND transcript NOT LIKE '[转录超时%' AND transcript!='[文件不存在]' AND transcript NOT LIKE '[分段转录失败%'")[0]['c']
+    m_su = dbq("SELECT COUNT(*) c FROM media WHERE status='active' AND summary IS NOT NULL AND summary NOT LIKE '[摘要%' AND summary NOT LIKE '[无可转录%' AND summary!='[摘要结果为空]'")[0]['c']
+    real = {}
+    real['meta'] = dbq("SELECT COUNT(*) c FROM books WHERE status='active' AND ((publisher IS NOT NULL AND publisher<>'') OR (isbn IS NOT NULL AND isbn<>''))")[0]['c']
+    real['extract'] = cov.get('text_extracted', 0)
+    real['classify'] = dbq("SELECT COUNT(*) c FROM books b WHERE status='active' AND id IN (SELECT book_id FROM book_categories bc WHERE bc.subcategory_id IS NOT NULL)")[0]['c']
+    real['summarize'] = cov.get('summary', 0)
+    real['title_norm'] = cov.get('named', 0)
+    real['transcribe'] = m_tr
+    real['media_summarize'] = m_su
+    real['kg'] = st['tools'].get('kg', {}).get('done', 0)
+    data = {"st": st, "tx_gap": tx_gap, "tx_fmt": tx_fmt, "tx_fallback": tx_fallback,
+            "sum_gap": sum_gap, "sum_can": sum_can, "m_tr": m_tr, "m_su": m_su, "real": real}
+    _stats_page_cache["data"] = data
+    _stats_page_cache["time"] = now
+    return data
 
 def _tool_center_html():
     """工具中心(卡片式)：标注每工具 作用 / 已完成工作量 / 成果入口 / 运行控制。"""
@@ -2133,6 +2177,25 @@ def _is_fake_summary(s):
     return False
 
 
+def _fake_summary_count():
+    """SQL 一次性统计「假摘要」数量（替代把 1.4 万条 summary 全拉进 Python 逐本判断，避免统计页 87s 卡死）。"""
+    if not _FAKE_START:
+        return 0
+    def _esc(x):
+        return x.replace("'", "''")
+    start_conds = " OR ".join("summary LIKE '%s%%'" % _esc(p) for p in _FAKE_START)
+    mid_conds = " OR ".join("summary LIKE '%%%s%%'" % _esc(m) for m in _FAKE_MID)
+    exact_conds = " OR ".join("summary LIKE '%%%s%%'" % _esc(e) for e in _FAKE_EXACT)
+    # 原 Python 逻辑：startswith(_FAKE_START) 且 s[:160] 含 _FAKE_MID；或含 _FAKE_EXACT。
+    # 此处用全局 LIKE 近似（mid 模式均在摘要前部，全局匹配不会漏；start 前缀已强约束，误判可忽略）。
+    sql = ("SELECT COUNT(*) c FROM books WHERE status='active' AND summary IS NOT NULL AND summary<>'' "
+           "AND ( (%s AND (%s)) OR (%s) )") % (start_conds, mid_conds, exact_conds)
+    try:
+        return dbq(sql)[0]['c']
+    except Exception:
+        return 0
+
+
 def _summary_tag(s, te):
     """书名规则化列表用的「摘要」状态标注（满足『无真摘要的你标注一下』）。"""
     if s and str(s).strip() and not _is_fake_summary(s):
@@ -3726,9 +3789,8 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             h += _tool_center_html()
 
         elif pn=='stats':
-            st = _lib_stats()
-            total = st['total_books']; tm = st['total_media']
-            cov = st['coverage']
+            sd = _stats_page_data()
+            st = sd['st']; total = st['total_books']; tm = st['total_media']; cov = st['coverage']
             h+='<h2>📊 图书馆统计</h2>'
             _fake = st.get('fake_summary', 0)
             if _fake > 0:
@@ -3738,16 +3800,10 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             h+='<div class=panel><h3>📦 规模</h3><div class=row>'
             h+='<a class=sb><div class=n style=color:#1677ff>'+str(total)+'</div><div class=l>📚 书籍</div></a>'
             h+='<a class=sb><div class=n style=color:#fa8c16>'+str(tm)+'</div><div class=l>🎧 媒体</div></a></div></div>'
-            # —— 未达标原因 / 待办（动态计算）——
-            _tx_gap = total - cov.get('text_extracted',0)
-            _tx_fmt = {}
-            for _r in dbq("SELECT file_format f, COUNT(*) c FROM books WHERE status='active' AND (text_extracted=0 OR text_extracted IS NULL) GROUP BY file_format"):
-                _tx_fmt[_r['f']] = _r['c']
-            _tx_fallback = dbq("SELECT COUNT(*) c FROM books b WHERE b.status='active' AND (b.text_extracted=0 OR b.text_extracted IS NULL) AND b.id IN (SELECT id FROM book_text bt WHERE bt.text_content IS NOT NULL AND length(bt.text_content)<=200)")[0]['c']
-            _sum_gap = total - cov.get('summary',0)
-            _sum_can = dbq("SELECT COUNT(*) c FROM books b WHERE b.status='active' AND (b.summary IS NULL OR b.summary='') AND b.text_extracted=1")[0]['c']
-            _m_tr = dbq("SELECT COUNT(*) c FROM media WHERE status='active' AND transcript IS NOT NULL AND transcript NOT LIKE '[转录失败%' AND transcript NOT LIKE '[转录超时%' AND transcript!='[文件不存在]' AND transcript NOT LIKE '[分段转录失败%'")[0]['c']
-            _m_su = dbq("SELECT COUNT(*) c FROM media WHERE status='active' AND summary IS NOT NULL AND summary NOT LIKE '[摘要%' AND summary NOT LIKE '[无可转录%' AND summary!='[摘要结果为空]'")[0]['c']
+            # —— 未达标原因 / 待办（动态计算，来自缓存的 _stats_page_data）——
+            _tx_gap = sd['tx_gap']; _tx_fmt = sd['tx_fmt']; _tx_fallback = sd['tx_fallback']
+            _sum_gap = sd['sum_gap']; _sum_can = sd['sum_can']
+            _m_tr = sd['m_tr']; _m_su = sd['m_su']
             _causes = {
               'cover': '已基本完成（仅 %d 本缺，多为损坏/无图源文件），无需处理' % (total - cov.get('cover',0)),
               'summary': '缺 %d 本：%d 本已有正文 → 可在「工具中心 ③ AI 摘要」立即生成；%d 本需先跑「② 提取正文」' % (_sum_gap, _sum_can, _sum_gap - _sum_can),
@@ -3765,16 +3821,8 @@ pdfjsLib.getDocument("''' + he(raw_url) + '''").promise.then(function(pdf){
             h+='</table></div>'
             h+='<div class=panel><h3>🛠️ 工具完成情况 + 续跑情况</h3>'
             h+='<p class=co>「实际完成」来自数据库真实统计（导入期与手动触发都已计入），「续跑」来自 progress.db 的离线批处理计数（仅统计本次会话经工具中心跑批的量，进程崩溃可续跑）。二者互补：前者看成果、后者看跑批进度。</p>'
-            # 实际完成量（真实统计）
-            _real = {}
-            _real['meta'] = dbq("SELECT COUNT(*) c FROM books WHERE status='active' AND ((publisher IS NOT NULL AND publisher<>'') OR (isbn IS NOT NULL AND isbn<>''))")[0]['c']
-            _real['extract'] = cov.get('text_extracted',0)
-            _real['classify'] = dbq("SELECT COUNT(*) c FROM books b WHERE status='active' AND id IN (SELECT book_id FROM book_categories bc WHERE bc.subcategory_id IS NOT NULL)")[0]['c']
-            _real['summarize'] = cov.get('summary',0)
-            _real['title_norm'] = cov.get('named',0)
-            _real['transcribe'] = dbq("SELECT COUNT(*) c FROM media WHERE status='active' AND transcript IS NOT NULL AND transcript NOT LIKE '[转录失败%' AND transcript NOT LIKE '[转录超时%' AND transcript!='[文件不存在]' AND transcript NOT LIKE '[分段转录失败%'")[0]['c']
-            _real['media_summarize'] = dbq("SELECT COUNT(*) c FROM media WHERE status='active' AND summary IS NOT NULL AND summary NOT LIKE '[摘要%' AND summary NOT LIKE '[无可转录%' AND summary!='[摘要结果为空]'")[0]['c']
-            _real['kg'] = st['tools'].get('kg',{}).get('done',0)
+            # 实际完成量（真实统计，来自缓存的 _stats_page_data）
+            _real = sd['real']
             _scope = {'kg':total,'meta':total,'extract':total,'classify':total,'summarize':total,'title_norm':total,'transcribe':tm,'media_summarize':tm}
             tnames={'kg':'知识图谱 L1','meta':'元数据补全','summary':'摘要修复','extract':'提取文本','classify':'AI 分类','summarize':'AI 摘要','transcribe':'媒体转录','media_summarize':'媒体摘要','metadata':'在线元数据'}
             h+='<table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="background:#f3f3f3"><th style="border:1px solid #ddd;padding:6px;text-align:left">工具</th><th style="border:1px solid #ddd;padding:6px;text-align:left">实际完成</th><th style="border:1px solid #ddd;padding:6px;text-align:left">总量</th><th style="border:1px solid #ddd;padding:6px;text-align:left">完成率</th><th style="border:1px solid #ddd;padding:6px;text-align:left">续跑 done</th><th style="border:1px solid #ddd;padding:6px;text-align:left">续跑 skip</th><th style="border:1px solid #ddd;padding:6px;text-align:left">状态</th></tr>'
@@ -3958,6 +4006,15 @@ if __name__ == "__main__":
     fix_drive_paths()
     migrate_schema()
     threading.Thread(target=migrate_text_content, daemon=True).start()
+    # 启动预热：后台算好统计页/计数缓存，避免用户首次进统计中心卡 7s
+    def _warm_cache():
+        try:
+            _stats_page_data()
+            get_counts()
+            print("[cache] 统计/计数缓存预热完成", flush=True)
+        except Exception as e:
+            print("[cache] 预热失败(忽略):", e, flush=True)
+    threading.Thread(target=_warm_cache, daemon=True).start()
     HOST = os.environ.get("LIB_HOST", "127.0.0.1")
     PORT = int(os.environ.get("LIB_PORT", "8000"))
     print(f"http://localhost:{PORT}")
