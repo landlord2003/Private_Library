@@ -901,12 +901,14 @@ function _pollExt(){
   x.onload=function(){
     var r=JSON.parse(x.responseText);var e=r.extract||{};
     if(e.total>0){
-      document.getElementById("extRes").innerHTML="提取中: "+e.done+"/"+e.total+" 本";
+      document.getElementById("extRes").innerHTML="提取中: "+e.done+"/"+e.total+" 本"+(e.done>=e.total?"":"（扫描版PDF会逐本尝试OCR，可能较慢）");
       if(e.done<e.total)_extTimer=setTimeout(_pollExt,2000);
-      else document.getElementById("extRes").innerHTML="✅ 提取完成: "+e.done+" 本 <a href=/ onclick=location.reload()>刷新</a>";
-    }else{
-      document.getElementById("extRes").innerHTML=e.total===0?"等待响应...":"";
+      else document.getElementById("extRes").innerHTML="✅ 提取完成: 成功 "+e.done+" 本 <a href=/ onclick=location.reload()>刷新</a>";
+    }else if(e.running){
+      document.getElementById("extRes").innerHTML="任务启动中，正在取待提取书单…";
       _extTimer=setTimeout(_pollExt,2000);
+    }else{
+      document.getElementById("extRes").innerHTML="✅ 没有待提取的书籍（已全部提取）";
     }
   };
   x.onerror=function(){document.getElementById("extRes").innerHTML="轮询出错，5秒后重试...";_extTimer=setTimeout(_pollExt,5000);};
@@ -1517,7 +1519,8 @@ def _ocr_pdf(file_path, max_pages=15):
                 # 历史上 tesseract 从未成功输出过一个字, 全部误判为"OCR 不可用")。
                 out_base = tempfile.NamedTemporaryFile(dir=_ocr_tmp, suffix="", delete=False).name
                 tessdata_dir = _os.path.join(_os.path.dirname(ts), "tessdata")
-                r = _sp.run([ts, tmp, out_base, "-l", "chi_sim+eng", "--tessdata-dir", tessdata_dir], capture_output=True, timeout=120)
+                # timeout=25：卡在 Web 抽取 30s 未来超时窗口内自清理，避免 tesseract 子进程被遗弃成孤儿
+                r = _sp.run([ts, tmp, out_base, "-l", "chi_sim+eng", "--tessdata-dir", tessdata_dir], capture_output=True, timeout=25)
                 out_txt = out_base + ".txt"
                 if r.returncode != 0:
                     print(f"[tesseract rc={r.returncode}] {str(r.stderr)[:200]}", flush=True)
@@ -1598,20 +1601,19 @@ def extract_text_for(book_id, file_path, fmt):
                 if i >= max_pages: break
                 text += page.get_text()
             doc.close()
-            # Scanned PDF fallback: 先 Unlimited-OCR(专治超大扫描/无文字层), 再 tesseract 兜底
+            # Scanned PDF fallback: 仅用轻量 tesseract CPU OCR 抽正文。
+            # 注意：Web 抽取路径**不再调用重型 Unlimited-OCR**(uocr_cli.py 会加载 6.7GB 模型，
+            # 且 Web 的 30s 超时只取消"等待"、杀不掉该子进程 → 每本泄漏一个常驻 6GB 进程，
+            # 导致内存耗尽、机器卡顿、抽取永远无进展)。重型扫描版 OCR 请走工具中心
+            # 「OCR重抽」流水线(run_extract_full.py ocr，独立 detached 进程，自带进度与子进程回收)。
             if not text.strip():
-                u = _ocr_unlimited(file_path, max_pages=20)
-                if u.strip():
-                    text = u
-                    print(f"[扫描版PDF] Unlimited-OCR 获取 {len(u)} 字: {title_short}", flush=True)
+                ocr = _ocr_pdf(file_path, max_pages=15)
+                if ocr.strip():
+                    text = ocr
+                    print(f"[扫描版PDF] tesseract OCR 获取 {len(ocr)} 字: {title_short}", flush=True)
                 else:
-                    ocr = _ocr_pdf(file_path, max_pages=15)
-                    if ocr.strip():
-                        text = ocr
-                        print(f"[扫描版PDF] tesseract OCR 获取 {len(ocr)} 字: {title_short}", flush=True)
-                    else:
-                        print(f"[扫描版PDF] 无文字层且OCR不可用, 用书名兜底: {title_short}", flush=True)
-                        return _title_fallback(book_id)
+                    print(f"[扫描版PDF] 无文字层且 tesseract 不可用/超时, 用书名兜底: {title_short}", flush=True)
+                    return _title_fallback(book_id)
         elif fmt == 'epub':
             # Use zipfile to read EPUB directly (more robust than ebooklib)
             import zipfile
@@ -1719,6 +1721,7 @@ def run_extract_async(count=10):
             # 不再扫 book_text 的 length()（会读全量 3GB 文本导致 MemoryError）。
             books = dbq("SELECT id,file_path,file_format,title FROM books WHERE status='active' AND text_extracted <> 1 LIMIT ?",(int(count),))
             rv = {"done":0,"total":len(books)}
+            _task_status['er_r'] = rv   # 立即公示总数：避免前端 e.total===0 时误显示"等待响应"
             for b in books:
                 try:
                     # Per-book timeout: 30 seconds max
@@ -1730,8 +1733,8 @@ def run_extract_async(count=10):
                         except concurrent.futures.TimeoutError:
                             print(f"[超时30s跳过] {b['title'][:40]} ({b['file_format']})", flush=True)
                             ok = _title_fallback(b['id'])
-                    if ok:
-                        rv["done"]+=1; _task_status['er_r']=rv
+                    rv["done"]+=1   # 无论成功/跳过都计入进度，前端才看得到"提取中 X/N"
+                    _task_status['er_r']=rv
                     _mark('extract', b['id'], 'done' if ok else 'skip')
                 except Exception as e: print(f"[批量提取异常] {b['title'][:30]}: {type(e).__name__}: {e}",flush=True)
             _task_status['er_r']=rv
@@ -3052,7 +3055,7 @@ class H(http.server.SimpleHTTPRequestHandler):
         try:
             if path=="/api/health": self.json({"status":"ok"})
             elif path=="/api/tools/status": self.json(_tool_status())
-            elif path=="/api/task-status": self.json({"classify":_task_status.get('cr_r',{}),"summarize":_task_status.get('sr_r',{}),"extract":_task_status.get('er_r',{}),"transcribe":_task_status.get('tr_r',{}),"transcribe_retry":_task_status.get('trr_r',{}),"media_summarize":_task_status.get('ms_r',{}),"media_resummarize_long":_task_status.get('msl_r',{}),"scan_import":_task_status.get('ir_r',{}),"metadata":_task_status.get('mr_r',{})})
+            elif path=="/api/task-status": self.json({"classify":_task_status.get('cr_r',{}),"summarize":_task_status.get('sr_r',{}),"extract":{**_task_status.get('er_r',{}),"running":bool(_task_status.get('er'))},"transcribe":_task_status.get('tr_r',{}),"transcribe_retry":_task_status.get('trr_r',{}),"media_summarize":_task_status.get('ms_r',{}),"media_resummarize_long":_task_status.get('msl_r',{}),"scan_import":_task_status.get('ir_r',{}),"metadata":_task_status.get('mr_r',{})})
             elif path=="/api/title-norm/recompute-status": self.json(_title_norm_recompute_status()); return
             elif path=="/api/stats": self.json(_lib_stats()); return
             elif path=="/api/summary-fix/pending": self.json(_summary_fix_pending()); return
