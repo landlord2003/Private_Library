@@ -51,7 +51,10 @@ def get_counts():
             # "可立即摘要" = 已有正文(text_extracted=1)且无摘要。口径不能只判 book_text 有内容：
             # 书名兜底也会往 book_text 写入标题行，会把 322 本实际无正文的书误算成"可摘要"
             # (实测：未摘要 490 本中，真正有正文可摘的仅 168 本)。
-            "sum_rem": "SELECT count(*)as c FROM books WHERE status='active' AND (summary IS NULL OR summary='') AND text_extracted=1",
+            # 2026-08-31 修正：此前只按 text_extracted 标志计数，会包含"正文<50字(仅书名兜底/极短抽取)"的
+            # 书，导致数字(193)远大于实际可摘要数(28)。现与 run_summary_smart_async 阶段2 选书口径对齐：
+            # 必须 JOIN book_text 且 length(text_content)>=50 才是真正能摘要的书。
+            "sum_rem": "SELECT count(*)as c FROM books b JOIN book_text t ON t.id=b.id WHERE b.status='active' AND (b.summary IS NULL OR b.summary='') AND b.text_extracted=1 AND length(t.text_content)>=50",
             # 口径修正(2026-08-30)：原按"book_text 表里无内容"统计，但书名兜底也会往 book_text
             # 写入标题行 → 该数恒为 0，与"未提取正文"的真实情况严重不符(实际 4575 本)。
             # 改用 text_extracted 标志：抽取成功置 1、书名兜底置 0，才是真正的"未提取正文"。
@@ -72,6 +75,13 @@ def get_counts():
             except Exception as e:
                 print(f"[count失败] {k}: {type(e).__name__}: {e}", flush=True)
                 _count_cache[k] = 0 if k not in ("fmt_dist","cat_dist") else []
+        # 假摘要待修复数：run_summary_smart_async 阶段1 会先重修这些"假摘要"书，
+        # 故点击摘要时实际处理量 = 假摘要数 + 可立即摘要数，需单列展示避免"数字对不上"。
+        try:
+            _count_cache["fake_pending"] = _summary_fix_pending().get("pending", 0)
+        except Exception as e:
+            print(f"[假摘要统计失败] {type(e).__name__}: {e}", flush=True)
+            _count_cache["fake_pending"] = 0
         c.close()
         _count_cache["time"] = time.time()
     except Exception as e:
@@ -337,11 +347,13 @@ def _tool_center_html():
     h += '<p class=co style="margin:0 6px 8px">按 <b>① 分类 → ② 提取正文 → ③ 摘要</b> 顺序跑。分类只需书名可最先跑；有了正文才能生成高质量摘要。</p>'
     # 待处理统计（原首页「AI 处理」面板显示，移至工具中心后补齐）
     _n_nosum = max(0, _tb - (cov.get('summary',0) or 0))
+    _fp = gc.get('fake_pending',0)
     h += ('<div class=panel style="margin:0 6px 10px;padding:10px 14px;font-size:13px">📊 <b>待处理</b>：'
           '未分类 <b style="color:#1677ff">%d</b> 本　·　未提取正文 <b style="color:#52c41a">%d</b> 本　·　未摘要 <b style="color:#722ed1">%d</b> 本'
-          '　<span style="color:#999">（其中已有正文、可立即摘要 <b style="color:#722ed1">%d</b> 本；其余 %d 本需先跑 ② 提取正文。'
+          '　<span style="color:#999">（可立即摘要 <b style="color:#722ed1">%d</b> 本；另有 <b style="color:#fa8c16">%d</b> 本「假摘要」点击时会一并重修；'
+          '其余 <b>%d</b> 本虽有抽取标志但正文不足 50 字，需先重跑 ② 提取正文。'
           '已分类 %d / 已抽正文 %d / 已有摘要 %d，共 %d 本）</span></div>'
-          ) % (gc.get('import_rem',0), gc.get('no_text',0), _n_nosum, gc.get('sum_rem',0),
+          ) % (gc.get('import_rem',0), gc.get('no_text',0), _n_nosum, gc.get('sum_rem',0), _fp,
                max(0, _n_nosum - (gc.get('sum_rem',0) or 0)), _cls, ext_n, cov.get('summary',0), _tb)
     h += '<div style="display:flex;flex-wrap:wrap">'
     h += card('🏷️','① AI 分类',
